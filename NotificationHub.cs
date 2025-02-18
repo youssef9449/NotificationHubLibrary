@@ -1,35 +1,28 @@
 ﻿using Microsoft.AspNet.SignalR;
+using System;
 using System.Collections.Generic;
 using System.Data.SqlClient;
-using System.Threading.Tasks;
-using System;
 using System.Linq;
+using System.Threading.Tasks;
 
 public class NotificationHub : Hub
 {
-    // --- Broadcast methods (now active) ---
-    public void SendNotificationToAll(string message)
-    {
-        Clients.All.receiveNotification(message);
-    }
-
-    public void SendNotificationToUser(string userId, string message)
-    {
-        // Send to a specific user by their user identifier (if using ASP.NET Identity, etc.)
-        Clients.User(userId).receiveNotification(message);
-    }
-
-    // --- Connection management & pending notifications ---
     private static readonly Dictionary<int, List<string>> _userConnections = new Dictionary<int, List<string>>();
     private static readonly object _connectionLock = new object();
     public static string connectionString = "Data Source=192.168.1.9;Initial Catalog=Users;User ID=sa;Password=123;";
+
+    /// <summary>
+    /// When a client connects, broadcast an update.
+    /// </summary>
     public override Task OnConnected()
     {
-        // When a client connects, let everyone know the user list may have changed.
         Clients.All.updateUserList();
         return base.OnConnected();
     }
 
+    /// <summary>
+    /// When a client disconnects, remove its connection and broadcast an update.
+    /// </summary>
     public override Task OnDisconnected(bool stopCalled)
     {
         lock (_connectionLock)
@@ -47,27 +40,64 @@ public class NotificationHub : Hub
                 }
             }
         }
-        // Notify all clients that the user list should be updated.
+        // Broadcast update so that clients refresh their user list.
         Clients.All.updateUserList();
         return base.OnDisconnected(stopCalled);
     }
 
-
-    public static List<string> GetConnectionIDsByUserID(int userID)
+    /// <summary>
+    /// Registers the current user's connection and delivers any pending notifications.
+    /// </summary>
+    /// <param name="userID">The user ID to register.</param>
+    public void RegisterUserConnection(int userID)
     {
         lock (_connectionLock)
         {
-            if (_userConnections.TryGetValue(userID, out var connections))
+            string connectionID = Context.ConnectionId;
+            if (!_userConnections.ContainsKey(userID))
             {
-                return connections.ToList(); // Return a copy to avoid modification issues
+                _userConnections[userID] = new List<string>();
             }
-            return new List<string>();
+            if (!_userConnections[userID].Contains(connectionID))
+            {
+                _userConnections[userID].Add(connectionID);
+            }
         }
+        // Notify all clients that the user list should be updated.
+        Clients.All.updateUserList();
+
+        // Deliver any pending notifications for this user.
+        DeliverPendingNotifications(userID);
     }
 
+    /// <summary>
+    /// Called by the client just before disconnecting (if using graceful shutdown).
+    /// This method can be invoked to force an update to all clients.
+    /// </summary>
+    /// <param name="userName">The name of the disconnecting user (optional).</param>
+    public void UserDisconnected(string userName)
+    {
+        // Optionally, update the database or perform other logic here.
+        // Then broadcast that the user list should be refreshed.
+        Clients.All.updateUserList();
+    }
+
+    /// <summary>
+    /// Sends a broadcast message to all connected clients.
+    /// </summary>
+    /// <param name="message">The message to send.</param>
+    public void SendNotificationToAll(string message)
+    {
+        Clients.All.receiveNotification(message);
+    }
+
+    /// <summary>
+    /// Sends a notification to a specific user. If the user is offline, it queues the message.
+    /// </summary>
+    /// <param name="receiverID">The receiver's user ID.</param>
+    /// <param name="message">The message text.</param>
     public void SendMessageNotification(int receiverID, string message)
     {
-        // Attempt to send the notification immediately if the user is connected
         var connectionIDs = GetConnectionIDsByUserID(receiverID);
         if (connectionIDs != null && connectionIDs.Count > 0)
         {
@@ -75,7 +105,7 @@ public class NotificationHub : Hub
         }
         else
         {
-            // User offline: log the notification in the PendingNotifications table
+            // User is offline: log or queue the notification.
             Console.WriteLine($"User {receiverID} is not connected. Message will be queued.");
             using (SqlConnection connection = new SqlConnection(connectionString))
             {
@@ -93,28 +123,24 @@ public class NotificationHub : Hub
         }
     }
 
-    public void RegisterUserConnection(int userID)
+    /// <summary>
+    /// Retrieves the connection IDs associated with a specific user.
+    /// </summary>
+    public static List<string> GetConnectionIDsByUserID(int userID)
     {
         lock (_connectionLock)
         {
-            string connectionID = Context.ConnectionId;
-            if (!_userConnections.ContainsKey(userID))
+            if (_userConnections.TryGetValue(userID, out var connections))
             {
-                _userConnections[userID] = new List<string>();
+                return connections.ToList();
             }
-            if (!_userConnections[userID].Contains(connectionID))
-            {
-                _userConnections[userID].Add(connectionID);
-            }
+            return new List<string>();
         }
-
-        // Notify all clients that the user list should be updated.
-        Clients.All.updateUserList();
-
-        // Deliver any pending notifications to this user.
-        DeliverPendingNotifications(userID);
     }
 
+    /// <summary>
+    /// Delivers any pending notifications stored in the database to the connected user.
+    /// </summary>
     private void DeliverPendingNotifications(int userID)
     {
         try
@@ -142,8 +168,6 @@ public class NotificationHub : Hub
                                 deliveredNotificationIDs.Add(notificationID);
                             }
                         }
-
-                        // Mark the delivered notifications as sent
                         if (deliveredNotificationIDs.Count > 0)
                         {
                             reader.Close();
