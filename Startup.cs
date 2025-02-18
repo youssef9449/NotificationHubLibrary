@@ -8,9 +8,9 @@ namespace NotificationHubLibrary
     {
         public void Configuration(IAppBuilder app)
         {
-            // Enable CORS if needed.
+            // Allow cross-origin requests if necessary
             app.UseCors(Microsoft.Owin.Cors.CorsOptions.AllowAll);
-            // Map SignalR hubs to the default "/signalr" route.
+            // Map SignalR hubs to the default "/signalr" endpoint
             app.MapSignalR();
         }
     }
