@@ -1,16 +1,16 @@
-﻿using Microsoft.AspNet.SignalR;
-using System;
-using System.Collections.Generic;
-using System.Data.SqlClient;
-using System.Linq;
-using System.Threading.Tasks;
+﻿    using Microsoft.AspNet.SignalR;
+    using System;
+    using System.Collections.Generic;
+    using System.Data.SqlClient;
+    using System.Linq;
+    using System.Threading.Tasks;
 
 public class NotificationHub : Hub
 {
     private static readonly Dictionary<int, List<string>> _userConnections = new Dictionary<int, List<string>>();
     private static readonly object _connectionLock = new object();
-    //public static string connectionString = "Data Source=192.168.1.9;Initial Catalog=Users;User ID=sa;Password=123;";
-    public static string connectionString = "Data Source=192.168.1.114;Initial Catalog=Users;Trusted_Connection=True;";
+    public static string connectionString = "Data Source=192.168.1.9;Initial Catalog=Users;User ID=sa;Password=123;";
+    //public static string connectionString = "Data Source=192.168.1.114;Initial Catalog=Users;Trusted_Connection=True;";
 
     /// <summary>
     /// When a client connects, broadcast an update.
@@ -142,6 +142,49 @@ public class NotificationHub : Hub
     /// <summary>
     /// Delivers any pending notifications stored in the database to the connected user.
     /// </summary>
+    /// 
+    public Dictionary<int, PendingMessageData> GetPendingMessageCounts(int receiverId)
+    {
+        var result = new Dictionary<int, PendingMessageData>();
+
+        using (var connection = new SqlConnection(connectionString))
+        {
+            connection.Open();
+
+            // Create SQL command
+            using (var cmd = new SqlCommand(
+                @"SELECT 
+                SenderID AS SenderId, 
+                COUNT(*) AS MessageCount, 
+                COALESCE(STRING_AGG(Message, '|'), '') AS Messages 
+              FROM PendingNotifications 
+              WHERE ReceiverID = @ReceiverID AND IsDelivered = 0 
+              GROUP BY SenderID",
+                connection))
+            {
+                cmd.Parameters.AddWithValue("@ReceiverID", receiverId);
+
+                // Execute the query
+                using (var reader = cmd.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        var senderId = reader.GetInt32(reader.GetOrdinal("SenderId"));
+                        var count = reader.GetInt32(reader.GetOrdinal("MessageCount"));
+                        var messages = reader.GetString(reader.GetOrdinal("Messages"));
+
+                        result[senderId] = new PendingMessageData
+                        {
+                            Count = count,
+                            Messages = messages.Split('|').ToList()
+                        };
+                    }
+                }
+            }
+        }
+
+        return result;
+    }
     private void DeliverPendingNotifications(int userID)
     {
         try
@@ -192,5 +235,102 @@ public class NotificationHub : Hub
         {
             Console.WriteLine($"Error delivering pending notifications: {ex.Message}");
         }
+    }
+    public void SendDirectedMessage(int senderId, int receiverId, string message)
+    {
+        var connections = GetConnectionIDsByUserID(receiverId);
+        if (connections.Count > 0)
+        {
+            Clients.Clients(connections).ReceivePendingMessage(senderId, message);
+        }
+        else
+        {
+            using (var connection = new SqlConnection(connectionString))
+            {
+                connection.Open();
+                using (var cmd = new SqlCommand(
+                    @"INSERT INTO PendingNotifications 
+                (SenderID, ReceiverID, Message, IsDelivered)
+                VALUES (@SenderID, @ReceiverID, @Message, 0)",
+                    connection))
+                {
+                    cmd.Parameters.AddWithValue("@SenderID", senderId);
+                    cmd.Parameters.AddWithValue("@ReceiverID", receiverId);
+                    cmd.Parameters.AddWithValue("@Message", message);
+                    cmd.ExecuteNonQuery();
+                }
+            }
+        }
+    }
+    public void NotifyMessageCount(int senderId, int receiverId)
+    {
+        using (var connection = new SqlConnection(connectionString))
+        {
+            connection.Open();
+            using (var cmd = new SqlCommand(
+                "SELECT COUNT(*) FROM PendingNotifications " +
+                "WHERE SenderId = @SenderId AND ReceiverId = @ReceiverId",
+                connection))
+            {
+                cmd.Parameters.AddWithValue("@SenderId", senderId);
+                cmd.Parameters.AddWithValue("@ReceiverId", receiverId);
+
+                var count = (int)cmd.ExecuteScalar();
+                Clients.User(receiverId.ToString()).UpdateMessageCount(senderId, count);
+            }
+        }
+    }
+    public List<string> GetPendingMessages(int receiverId, int senderId)
+    {
+        var messages = new List<string>();
+
+        using (var connection = new SqlConnection(connectionString))
+        {
+            connection.Open();
+            using (var cmd = new SqlCommand(
+                "SELECT Message FROM PendingNotifications " +
+                "WHERE ReceiverId = @ReceiverId AND SenderId = @SenderId",
+                connection))
+            {
+                cmd.Parameters.AddWithValue("@ReceiverId", receiverId);
+                cmd.Parameters.AddWithValue("@SenderId", senderId);
+
+                using (var reader = cmd.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        messages.Add(reader["Message"].ToString());
+                    }
+                }
+            }
+        }
+        return messages;
+    }
+
+    public void MarkMessagesAsDelivered(int senderId, int receiverId)
+    {
+        using (var connection = new SqlConnection(connectionString))
+        {
+            connection.Open();
+            using (var cmd = new SqlCommand(
+                @"UPDATE PendingNotifications 
+              SET IsDelivered = 1 
+              WHERE SenderID = @SenderID 
+              AND ReceiverID = @ReceiverID
+              AND IsDelivered = 0",
+                connection))
+            {
+                cmd.Parameters.AddWithValue("@SenderID", senderId);
+                cmd.Parameters.AddWithValue("@ReceiverID", receiverId);
+                cmd.ExecuteNonQuery();
+            }
+        }
+        Clients.All.updateMessageCounts(receiverId, senderId, 0);
+    }
+
+    public class PendingMessageData
+    {
+        public int Count { get; set; }
+        public List<string> Messages { get; set; }
     }
 }
