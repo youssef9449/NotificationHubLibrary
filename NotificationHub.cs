@@ -9,7 +9,8 @@ public class NotificationHub : Hub
 {
     private static readonly Dictionary<int, List<string>> _userConnections = new Dictionary<int, List<string>>();
     private static readonly object _connectionLock = new object();
-    public static string connectionString = "Data Source=192.168.1.9;Initial Catalog=Users;User ID=sa;Password=123;";
+    //public static string connectionString = "Data Source=192.168.1.9;Initial Catalog=Users;User ID=sa;Password=123;";
+    public static string connectionString = "Data Source=192.168.1.114;Initial Catalog=Users;Trusted_Connection=True;";
 
     /// <summary>
     /// When a client connects, broadcast an update.
