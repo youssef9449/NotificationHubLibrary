@@ -10,18 +10,35 @@ public class NotificationHub : Hub
     private static readonly Dictionary<int, List<string>> _userConnections = new Dictionary<int, List<string>>();
     private static readonly object _connectionLock = new object();
     public static string connectionString = "Data Source=192.168.1.9;Initial Catalog=Users;User ID=sa;Password=123;";
+    //public static string connectionString = "Data Source=192.168.1.114;Initial Catalog=Users;Trusted_Connection=True;";
+
 
     public override Task OnConnected()
     {
         Clients.All.updateUserList();
         return base.OnConnected();
     }
-
-    public override Task OnDisconnected(bool stopCalled)
+    public async Task DisconnectUser(int userId)
     {
         lock (_connectionLock)
         {
-            string connectionID = Context.ConnectionId;
+            if (_userConnections.ContainsKey(userId))
+            {
+                _userConnections.Remove(userId);
+            }
+        }
+
+        await UpdateUserConnectionStatusAsync(userId, false);
+        await Clients.All.SendAsync("updateUserList");
+    }
+
+    public override async Task OnDisconnected(bool stopCalled)
+    {
+        string connectionID = Context.ConnectionId;
+        int? disconnectedUserID = null;
+
+        lock (_connectionLock)
+        {
             foreach (var userID in _userConnections.Keys.ToList())
             {
                 if (_userConnections[userID].Contains(connectionID))
@@ -29,15 +46,25 @@ public class NotificationHub : Hub
                     _userConnections[userID].Remove(connectionID);
                     if (_userConnections[userID].Count == 0)
                     {
+                        disconnectedUserID = userID;
                         _userConnections.Remove(userID);
                     }
+                    break;
                 }
             }
         }
-        Clients.All.updateUserList();
-        return base.OnDisconnected(stopCalled);
-    }
 
+        if (disconnectedUserID.HasValue)
+        {
+            await DisconnectUser(disconnectedUserID.Value); // Reuse the centralized method
+        }
+        else
+        {
+            await Clients.All.SendAsync("updateUserList"); // Still notify if no user found
+        }
+
+        await base.OnDisconnected(stopCalled);
+    }
     public void RegisterUserConnection(int userID)
     {
         lock (_connectionLock)
@@ -50,23 +77,76 @@ public class NotificationHub : Hub
             if (!_userConnections[userID].Contains(connectionID))
             {
                 _userConnections[userID].Add(connectionID);
+                Console.WriteLine($"Registered connection {connectionID} for user {userID}");
             }
         }
-        Clients.All.updateUserList();
+        Clients.All.SendAsync("updateUserList");
         DeliverPendingChatMessages(userID);
     }
 
-    public void SendNotification(List<int> receiverIDs, string message, int? senderID = null, bool isChatMessage = false, bool queueIfOffline = false)
+    private async Task UpdateUserConnectionStatusAsync(int userId, bool isConnected)
+    {
+        try
+        {
+            using (var connection = new SqlConnection(connectionString))
+            {
+                await connection.OpenAsync();
+                using (var cmd = new SqlCommand(
+                    "UPDATE Users SET isConnected = @IsConnected WHERE UserID = @UserID",
+                    connection))
+                {
+                    cmd.Parameters.AddWithValue("@IsConnected", isConnected ? 1 : 0);
+                    cmd.Parameters.AddWithValue("@UserID", userId);
+                    await cmd.ExecuteNonQueryAsync();
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error updating user connection status: {ex.Message}\nStackTrace: {ex.StackTrace}");
+        }
+    }
+    public List<int> GetConnectedUserIDs()
+    {
+        lock (_connectionLock)
+        {
+            return _userConnections.Keys.ToList();
+        }
+    }
+
+    /* public void RegisterUserConnection(int userID)
+     {
+         lock (_connectionLock)
+         {
+             string connectionID = Context.ConnectionId;
+             if (!_userConnections.ContainsKey(userID))
+             {
+                 _userConnections[userID] = new List<string>();
+             }
+             if (!_userConnections[userID].Contains(connectionID))
+             {
+                 _userConnections[userID].Add(connectionID);
+             }
+         }
+         Clients.All.updateUserList();
+         DeliverPendingChatMessages(userID);
+         UpdateUserConnectionStatus(userID, true); // Add this
+     }*/
+
+    public async Task SendNotification(List<int> receiverIDs, string message, int? senderID = null, bool isChatMessage = false, bool queueIfOffline = false)
     {
         if (receiverIDs == null || !receiverIDs.Any())
         {
             if (isChatMessage && senderID.HasValue)
             {
-                Clients.All.receivePendingMessage(senderID.Value, message);
+                Console.WriteLine($"Broadcasting chat message from {senderID.Value} to all: {message}");
+                await Clients.All.SendAsync("receivePendingMessage", senderID.Value, message);
             }
             else
             {
-                Clients.All.receiveGeneralNotification(message);
+                Console.WriteLine($"Broadcasting general notification to all: {message}");
+                await Clients.All.SendAsync("receiveGeneralNotification", message);
+                await InsertGeneralNotificationAsync(null, senderID, message); // Insert for all users
             }
             return;
         }
@@ -78,34 +158,71 @@ public class NotificationHub : Hub
             {
                 if (isChatMessage && senderID.HasValue)
                 {
-                    Clients.Clients(connectionIDs).receivePendingMessage(senderID.Value, message);
+                    Console.WriteLine($"Sending chat message from {senderID.Value} to {receiverID}: {message}");
+                    await Clients.Clients(connectionIDs).SendAsync("receivePendingMessage", senderID.Value, message);
                 }
                 else
                 {
-                    Clients.Clients(connectionIDs).receiveGeneralNotification(message);
+                    Console.WriteLine($"Sending general notification to {receiverID}: {message}");
+                    await Clients.Clients(connectionIDs).SendAsync("receiveGeneralNotification", message);
+                    await InsertGeneralNotificationAsync(receiverID, senderID, message);
                 }
             }
-            else if (queueIfOffline && isChatMessage) // Only queue chat messages
+            else if (queueIfOffline)
             {
-                using (SqlConnection connection = new SqlConnection(connectionString))
+                if (isChatMessage)
                 {
-                    connection.Open();
-                    using (var cmd = new SqlCommand(
-                        "INSERT INTO PendingChatMessages (SenderID, ReceiverID, Message, CreatedAt, IsDelivered) " +
-                        "VALUES (@SenderID, @ReceiverID, @Message, @CreatedAt, 0)",
-                        connection))
+                    using (SqlConnection connection = new SqlConnection(connectionString))
                     {
-                        cmd.Parameters.AddWithValue("@SenderID", senderID ?? (object)DBNull.Value);
-                        cmd.Parameters.AddWithValue("@ReceiverID", receiverID);
-                        cmd.Parameters.AddWithValue("@Message", message);
-                        cmd.Parameters.AddWithValue("@CreatedAt", DateTime.Now);
-                        cmd.ExecuteNonQuery();
+                        await connection.OpenAsync();
+                        using (var cmd = new SqlCommand(
+                            "INSERT INTO PendingChatMessages (SenderID, ReceiverID, Message, CreatedAt, IsDelivered) " +
+                            "VALUES (@SenderID, @ReceiverID, @Message, @CreatedAt, 0)",
+                            connection))
+                        {
+                            cmd.Parameters.AddWithValue("@SenderID", senderID ?? (object)DBNull.Value);
+                            cmd.Parameters.AddWithValue("@ReceiverID", receiverID);
+                            cmd.Parameters.AddWithValue("@Message", message);
+                            cmd.Parameters.AddWithValue("@CreatedAt", DateTime.Now);
+                            await cmd.ExecuteNonQueryAsync();
+                            Console.WriteLine($"Queued chat message for offline user {receiverID} from {senderID}");
+                        }
                     }
+                }
+                else
+                {
+                    // Queue general notification for offline users
+                    await InsertGeneralNotificationAsync(receiverID, senderID, message);
                 }
             }
         }
     }
 
+    private async Task InsertGeneralNotificationAsync(int? receiverID, int? senderID, string messageText)
+    {
+        try
+        {
+            using (SqlConnection connection = new SqlConnection(connectionString))
+            {
+                await connection.OpenAsync();
+                using (var cmd = new SqlCommand(
+                    "INSERT INTO Notifications (ReceiverID, SenderID, MessageText, IsSeen, Timestamp) " +
+                    "VALUES (@ReceiverID, @SenderID, @MessageText, 0, GETDATE())",
+                    connection))
+                {
+                    cmd.Parameters.AddWithValue("@ReceiverID", (object)receiverID ?? DBNull.Value);
+                    cmd.Parameters.AddWithValue("@SenderID", (object)senderID ?? DBNull.Value);
+                    cmd.Parameters.AddWithValue("@MessageText", messageText);
+                    await cmd.ExecuteNonQueryAsync();
+                    Console.WriteLine($"Inserted general notification for ReceiverID: {receiverID}, SenderID: {senderID}");
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error inserting notification: {ex.Message}\nStackTrace: {ex.StackTrace}");
+        }
+    }
     public static List<string> GetConnectionIDsByUserID(int userID)
     {
         lock (_connectionLock)
@@ -208,23 +325,32 @@ public class NotificationHub : Hub
 
     public void MarkMessagesAsDelivered(int senderId, int receiverId)
     {
-        using (var connection = new SqlConnection(connectionString))
+        try
         {
-            connection.Open();
-            using (var cmd = new SqlCommand(
-                @"UPDATE PendingChatMessages 
-              SET IsDelivered = 1 
-              WHERE SenderID = @SenderID 
-              AND ReceiverID = @ReceiverID
-              AND IsDelivered = 0",
-                connection))
+            using (var connection = new SqlConnection(connectionString))
             {
-                cmd.Parameters.AddWithValue("@SenderID", senderId);
-                cmd.Parameters.AddWithValue("@ReceiverID", receiverId);
-                cmd.ExecuteNonQuery();
+                connection.Open();
+                using (var cmd = new SqlCommand(
+                    @"UPDATE PendingChatMessages 
+                  SET IsDelivered = 1 
+                  WHERE SenderID = @SenderID 
+                  AND ReceiverID = @ReceiverID 
+                  AND IsDelivered = 0",
+                    connection))
+                {
+                    cmd.Parameters.AddWithValue("@SenderID", senderId);
+                    cmd.Parameters.AddWithValue("@ReceiverID", receiverId);
+                    cmd.ExecuteNonQuery();
+                }
             }
+            // Notify clients to update message counts.
+            Clients.All.updateMessageCounts(receiverId, senderId, 0);
         }
-        Clients.All.updateMessageCounts(receiverId, senderId, 0);
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error in MarkMessagesAsDelivered: {ex.Message}\nStackTrace: {ex.StackTrace}");
+            throw; // Propagate the error to the client for debugging.
+        }
     }
 
     public class PendingMessageData
