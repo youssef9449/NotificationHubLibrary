@@ -29,7 +29,7 @@ public class NotificationHub : Hub
         }
 
         await UpdateUserConnectionStatusAsync(userId, false);
-        await Clients.All.SendAsync("updateUserList");
+        Clients.All.updateUserList();
     }
 
     public override async Task OnDisconnected(bool stopCalled)
@@ -60,7 +60,7 @@ public class NotificationHub : Hub
         }
         else
         {
-            await Clients.All.SendAsync("updateUserList"); // Still notify if no user found
+            Clients.All.updateUserList();       // Still notify if no user found
         }
 
         await base.OnDisconnected(stopCalled);
@@ -80,7 +80,7 @@ public class NotificationHub : Hub
                 Console.WriteLine($"Registered connection {connectionID} for user {userID}");
             }
         }
-        Clients.All.SendAsync("updateUserList");
+        Clients.All.updateUserList();
         DeliverPendingChatMessages(userID);
     }
 
@@ -135,17 +135,20 @@ public class NotificationHub : Hub
 
     public async Task SendNotification(List<int> receiverIDs, string message, int? senderID = null, bool isChatMessage = false, bool queueIfOffline = false)
     {
+
         if (receiverIDs == null || !receiverIDs.Any())
         {
             if (isChatMessage && senderID.HasValue)
             {
                 Console.WriteLine($"Broadcasting chat message from {senderID.Value} to all: {message}");
-                await Clients.All.SendAsync("receivePendingMessage", senderID.Value, message);
+                Clients.All.receivePendingMessage(senderID.Value, message);
+
             }
             else
             {
                 Console.WriteLine($"Broadcasting general notification to all: {message}");
-                await Clients.All.SendAsync("receiveGeneralNotification", message);
+                Clients.All.receiveGeneralNotification(senderID.Value, message);
+
                 await InsertGeneralNotificationAsync(null, senderID, message); // Insert for all users
             }
             return;
@@ -154,18 +157,18 @@ public class NotificationHub : Hub
         foreach (int receiverID in receiverIDs.Distinct())
         {
             var connectionIDs = GetConnectionIDsByUserID(receiverID);
+
             if (connectionIDs != null && connectionIDs.Count > 0)
             {
                 if (isChatMessage && senderID.HasValue)
                 {
-                    Console.WriteLine($"Sending chat message from {senderID.Value} to {receiverID}: {message}");
-                    await Clients.Clients(connectionIDs).SendAsync("receivePendingMessage", senderID.Value, message);
+                    //Console.WriteLine($"Sending chat message from {senderID.Value} to {receiverID}: {message}");
+                    Clients.Clients(connectionIDs).receivePendingMessage(senderID.Value, message);
                 }
                 else
                 {
                     Console.WriteLine($"Sending general notification to {receiverID}: {message}");
-                    await Clients.Clients(connectionIDs).SendAsync("receiveGeneralNotification", message);
-                    await InsertGeneralNotificationAsync(receiverID, senderID, message);
+                    Clients.Clients(connectionIDs).receiveGeneralNotification(senderID.Value, message);
                 }
             }
             else if (queueIfOffline)
@@ -332,10 +335,11 @@ public class NotificationHub : Hub
                 connection.Open();
                 using (var cmd = new SqlCommand(
                     @"UPDATE PendingChatMessages 
-                  SET IsDelivered = 1 
+                  SET IsDelivered = 1, 
+                      DeliveredAt = GETDATE() 
                   WHERE SenderID = @SenderID 
-                  AND ReceiverID = @ReceiverID 
-                  AND IsDelivered = 0",
+                    AND ReceiverID = @ReceiverID 
+                    AND IsDelivered = 0",
                     connection))
                 {
                     cmd.Parameters.AddWithValue("@SenderID", senderId);
