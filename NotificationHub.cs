@@ -11,6 +11,7 @@ public class NotificationHub : Hub
     private static readonly object _connectionLock = new object();
     public static string connectionString = "Data Source=192.168.1.9;Initial Catalog=Users;User ID=sa;Password=123;";
     //public static string connectionString = "Data Source=192.168.1.114;Initial Catalog=Users;Trusted_Connection=True;";
+    private static readonly string[] hrRoles = new string[] { "Human Resources" }; // Adjust based on your system
 
 
     public override Task OnConnected()
@@ -30,6 +31,69 @@ public class NotificationHub : Hub
 
         await UpdateUserConnectionStatusAsync(userId, false);
         Clients.All.updateUserList();
+    }
+    public void RegisterUserConnection(int userId)
+    {
+        lock (_connectionLock)
+        {
+            string connectionId = Context.ConnectionId;
+            if (!_userConnections.ContainsKey(userId))
+            {
+                _userConnections[userId] = new List<string>();
+            }
+            if (!_userConnections[userId].Contains(connectionId))
+            {
+                _userConnections[userId].Add(connectionId);
+            }
+        }
+
+        Clients.All.updateUserList();
+        DeliverPendingChatMessages(userId);
+
+        // Add user to appropriate groups based on role and departments
+        using (var connection = new SqlConnection(connectionString))
+        {
+            connection.Open();
+            string query = "SELECT Role, Department FROM Users WHERE UserID = @UserID";
+            using (var cmd = new SqlCommand(query, connection))
+            {
+                cmd.Parameters.AddWithValue("@UserID", userId);
+                using (var reader = cmd.ExecuteReader())
+                {
+                    if (reader.Read())
+                    {
+                        string role = reader.GetString(0);
+                        string department = reader.IsDBNull(1) ? "" : reader.GetString(1);
+
+                        // HR group
+                        if (hrRoles.Any(r => role.Contains(r)))
+                        {
+                            Groups.Add(Context.ConnectionId, "HR");
+                        }
+
+                        // Manager groups
+                        if (role == "Manager" || role == "Team Leader")
+                        {
+                            string[] departments = department.Split(new[] { " - " }, StringSplitOptions.RemoveEmptyEntries);
+                            foreach (string dept in departments)
+                            {
+                                string groupName = "Manager_" + dept.Trim();
+                                Groups.Add(Context.ConnectionId, groupName);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    public async Task NotifyNewRequest(string department)
+    {
+        // Notify HR and manager groups to refresh requests and notifications
+        await Clients.Group("HR").RefreshRequests();
+        await Clients.Group("Manager_" + department).RefreshRequests();
+        await Clients.Group("HR").RefreshNotifications();
+        await Clients.Group("Manager_" + department).RefreshNotifications();
     }
 
     public override async Task OnDisconnected(bool stopCalled)
@@ -64,24 +128,6 @@ public class NotificationHub : Hub
         }
 
         await base.OnDisconnected(stopCalled);
-    }
-    public void RegisterUserConnection(int userID)
-    {
-        lock (_connectionLock)
-        {
-            string connectionID = Context.ConnectionId;
-            if (!_userConnections.ContainsKey(userID))
-            {
-                _userConnections[userID] = new List<string>();
-            }
-            if (!_userConnections[userID].Contains(connectionID))
-            {
-                _userConnections[userID].Add(connectionID);
-                Console.WriteLine($"Registered connection {connectionID} for user {userID}");
-            }
-        }
-        Clients.All.updateUserList();
-        DeliverPendingChatMessages(userID);
     }
 
     private async Task UpdateUserConnectionStatusAsync(int userId, bool isConnected)
@@ -142,7 +188,6 @@ public class NotificationHub : Hub
             {
                 Console.WriteLine($"Broadcasting chat message from {senderID.Value} to all: {message}");
                 Clients.All.receivePendingMessage(senderID.Value, message);
-
             }
             else
             {
