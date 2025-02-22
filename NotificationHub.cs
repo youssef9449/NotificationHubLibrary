@@ -16,7 +16,7 @@ public class NotificationHub : Hub
 
     public override Task OnConnected()
     {
-        Clients.All.updateUserList();
+        // Avoid full refresh here, handled in RegisterUserConnection
         return base.OnConnected();
     }
     public async Task DisconnectUser(int userId)
@@ -44,13 +44,12 @@ public class NotificationHub : Hub
             if (!_userConnections[userId].Contains(connectionId))
             {
                 _userConnections[userId].Add(connectionId);
+                Console.WriteLine($"Registered connection {connectionId} for user {userId}");
             }
         }
 
-        Clients.All.updateUserList();
         DeliverPendingChatMessages(userId);
 
-        // Add user to appropriate groups based on role and departments
         using (var connection = new SqlConnection(connectionString))
         {
             connection.Open();
@@ -65,28 +64,26 @@ public class NotificationHub : Hub
                         string role = reader.GetString(0);
                         string department = reader.IsDBNull(1) ? "" : reader.GetString(1);
 
-                        // HR group
                         if (hrRoles.Any(r => role.Contains(r)))
                         {
                             Groups.Add(Context.ConnectionId, "HR");
                         }
 
-                        // Manager groups
                         if (role == "Manager" || role == "Team Leader")
                         {
                             string[] departments = department.Split(new[] { " - " }, StringSplitOptions.RemoveEmptyEntries);
                             foreach (string dept in departments)
                             {
-                                string groupName = "Manager_" + dept.Trim();
-                                Groups.Add(Context.ConnectionId, groupName);
+                                Groups.Add(Context.ConnectionId, "Manager_" + dept.Trim());
                             }
                         }
                     }
                 }
             }
         }
-    }
 
+        Clients.AllExcept(Context.ConnectionId).updateUserStatus(userId, true);
+    }
     public async Task NotifyNewRequest(string department)
     {
         // Notify HR and manager groups to refresh requests and notifications
@@ -95,8 +92,14 @@ public class NotificationHub : Hub
         await Clients.Group("HR").RefreshNotifications();
         await Clients.Group("Manager_" + department).RefreshNotifications();
     }
-
-    public override async Task OnDisconnected(bool stopCalled)
+    public async Task NotifyNewRequestWithDetails(string department, int requestId, string userFullName, string requestType, string requestFromDay, string requestStatus)
+    {
+        await Clients.Group("HR").AddNewRequest(requestId, userFullName, requestType, requestFromDay, requestStatus);
+        await Clients.Group("Manager_" + department).AddNewRequest(requestId, userFullName, requestType, requestFromDay, requestStatus);
+        await Clients.Group("HR").RefreshNotifications();
+        await Clients.Group("Manager_" + department).RefreshNotifications();
+    }
+    public override Task OnDisconnected(bool stopCalled)
     {
         string connectionID = Context.ConnectionId;
         int? disconnectedUserID = null;
@@ -120,14 +123,11 @@ public class NotificationHub : Hub
 
         if (disconnectedUserID.HasValue)
         {
-            await DisconnectUser(disconnectedUserID.Value); // Reuse the centralized method
-        }
-        else
-        {
-            Clients.All.updateUserList();       // Still notify if no user found
+            DisconnectUser(disconnectedUserID.Value); // Keep as non-async for compatibility
+            Clients.All.updateUserStatus(disconnectedUserID.Value, false);
         }
 
-        await base.OnDisconnected(stopCalled);
+        return base.OnDisconnected(stopCalled);
     }
 
     private async Task UpdateUserConnectionStatusAsync(int userId, bool isConnected)
@@ -181,7 +181,6 @@ public class NotificationHub : Hub
 
     public async Task SendNotification(List<int> receiverIDs, string message, int? senderID = null, bool isChatMessage = false, bool queueIfOffline = false)
     {
-
         if (receiverIDs == null || !receiverIDs.Any())
         {
             if (isChatMessage && senderID.HasValue)
@@ -192,8 +191,7 @@ public class NotificationHub : Hub
             else
             {
                 Console.WriteLine($"Broadcasting general notification to all: {message}");
-                Clients.All.receiveGeneralNotification(senderID.Value, message);
-
+                Clients.All.receiveGeneralNotification(senderID.HasValue ? senderID.Value : 0, message);
                 await InsertGeneralNotificationAsync(null, senderID, message); // Insert for all users
             }
             return;
@@ -201,19 +199,26 @@ public class NotificationHub : Hub
 
         foreach (int receiverID in receiverIDs.Distinct())
         {
+            // Explicitly exclude the sender from receiving their own chat message
+            if (isChatMessage && senderID.HasValue && receiverID == senderID.Value)
+            {
+                Console.WriteLine($"Skipping chat message for sender {senderID.Value}");
+                continue;
+            }
+
             var connectionIDs = GetConnectionIDsByUserID(receiverID);
 
             if (connectionIDs != null && connectionIDs.Count > 0)
             {
                 if (isChatMessage && senderID.HasValue)
                 {
-                    //Console.WriteLine($"Sending chat message from {senderID.Value} to {receiverID}: {message}");
+                    Console.WriteLine($"Sending chat message from {senderID.Value} to {receiverID}: {message}");
                     Clients.Clients(connectionIDs).receivePendingMessage(senderID.Value, message);
                 }
                 else
                 {
                     Console.WriteLine($"Sending general notification to {receiverID}: {message}");
-                    Clients.Clients(connectionIDs).receiveGeneralNotification(senderID.Value, message);
+                    Clients.Clients(connectionIDs).receiveGeneralNotification(senderID.HasValue ? senderID.Value : 0, message);
                 }
             }
             else if (queueIfOffline)
@@ -239,13 +244,11 @@ public class NotificationHub : Hub
                 }
                 else
                 {
-                    // Queue general notification for offline users
                     await InsertGeneralNotificationAsync(receiverID, senderID, message);
                 }
             }
         }
     }
-
     private async Task InsertGeneralNotificationAsync(int? receiverID, int? senderID, string messageText)
     {
         try
