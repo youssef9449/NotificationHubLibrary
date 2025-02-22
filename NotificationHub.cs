@@ -212,7 +212,7 @@ public class NotificationHub : Hub
             {
                 if (isChatMessage && senderID.HasValue)
                 {
-                    Console.WriteLine($"Sending chat message from {senderID.Value} to {receiverID}: {message}");
+                   // Console.WriteLine($"Sending chat message from {senderID.Value} to {receiverID}: {message}");
                     Clients.Clients(connectionIDs).receivePendingMessage(senderID.Value, message);
                 }
                 else
@@ -238,7 +238,7 @@ public class NotificationHub : Hub
                             cmd.Parameters.AddWithValue("@Message", message);
                             cmd.Parameters.AddWithValue("@CreatedAt", DateTime.Now);
                             await cmd.ExecuteNonQueryAsync();
-                            Console.WriteLine($"Queued chat message for offline user {receiverID} from {senderID}");
+                       //     Console.WriteLine($"Queued chat message for offline user {receiverID} from {senderID}");
                         }
                     }
                 }
@@ -402,6 +402,18 @@ public class NotificationHub : Hub
         {
             Console.WriteLine($"Error in MarkMessagesAsDelivered: {ex.Message}\nStackTrace: {ex.StackTrace}");
             throw; // Propagate the error to the client for debugging.
+        }
+    }
+    public void NotifyAffectedUsers(List<int> userIds)
+    {
+        foreach (int userId in userIds)
+        {
+            var connectionIDs = GetConnectionIDsByUserID(userId);
+            if (connectionIDs != null && connectionIDs.Count > 0)
+            {
+                //Console.WriteLine($"Notifying user {userId} to refresh requests.");
+                Clients.Clients(connectionIDs).RefreshRequests();
+            }
         }
     }
 
