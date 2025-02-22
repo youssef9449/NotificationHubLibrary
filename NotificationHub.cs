@@ -44,7 +44,7 @@ public class NotificationHub : Hub
             if (!_userConnections[userId].Contains(connectionId))
             {
                 _userConnections[userId].Add(connectionId);
-                Console.WriteLine($"Registered connection {connectionId} for user {userId}");
+                //Console.WriteLine($"Registered connection {connectionId} for user {userId}");
             }
         }
 
