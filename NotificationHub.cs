@@ -185,24 +185,54 @@ public class NotificationHub : Hub
         {
             if (isChatMessage && senderID.HasValue)
             {
-                Console.WriteLine($"Broadcasting chat message from {senderID.Value} to all: {message}");
-                Clients.All.receivePendingMessage(senderID.Value, message);
+                Console.WriteLine($"Broadcasting chat message from {senderID.Value} to all online users: {message}");
+                var onlineUserIds = GetConnectedUserIDs(); // Get only online users
+                foreach (int userId in onlineUserIds)
+                {
+                    if (senderID.HasValue && userId == senderID.Value)
+                    {
+                        Console.WriteLine($"Skipping chat message for sender {senderID.Value}");
+                        continue;
+                    }
+                    var connectionIDs = GetConnectionIDsByUserID(userId);
+                    if (connectionIDs != null && connectionIDs.Count > 0)
+                    {
+                        Clients.Clients(connectionIDs).receivePendingMessage(senderID.Value, message);
+                    }
+                }
             }
             else
             {
-                Console.WriteLine($"Broadcasting general notification to all: {message}");
-                Clients.All.receiveGeneralNotification(senderID.HasValue ? senderID.Value : 0, message);
-                await InsertGeneralNotificationAsync(null, senderID, message); // Insert for all users
+                Console.WriteLine($"Broadcasting general notification from {senderID ?? -1} to all online users: {message}");
+                var onlineUserIds = GetConnectedUserIDs(); // Get only online users
+                if (senderID.HasValue)
+                {
+                    onlineUserIds = onlineUserIds.Where(id => id != senderID.Value).ToList(); // Exclude sender
+                }
+
+                if (onlineUserIds.Any())
+                {
+                    foreach (int userId in onlineUserIds)
+                    {
+                        var connectionIDs = GetConnectionIDsByUserID(userId);
+                        if (connectionIDs != null && connectionIDs.Count > 0)
+                        {
+                            Clients.Clients(connectionIDs).receiveGeneralNotification(senderID.Value, message);
+                        }
+                    }
+                    // Insert notification for online users only, excluding the sender
+                    await InsertGeneralNotificationForOnlineUsers(onlineUserIds, senderID, message);
+                }
             }
             return;
         }
 
         foreach (int receiverID in receiverIDs.Distinct())
         {
-            // Explicitly exclude the sender from receiving their own chat message
-            if (isChatMessage && senderID.HasValue && receiverID == senderID.Value)
+            // Explicitly exclude the sender from receiving their own message (chat or general)
+            if ((isChatMessage || !isChatMessage) && senderID.HasValue && receiverID == senderID.Value)
             {
-                Console.WriteLine($"Skipping chat message for sender {senderID.Value}");
+                Console.WriteLine($"Skipping {(isChatMessage ? "chat" : "general")} message for sender {senderID.Value}");
                 continue;
             }
 
@@ -212,13 +242,13 @@ public class NotificationHub : Hub
             {
                 if (isChatMessage && senderID.HasValue)
                 {
-                   // Console.WriteLine($"Sending chat message from {senderID.Value} to {receiverID}: {message}");
+               //     Console.WriteLine($"Sending chat message from {senderID.Value} to {receiverID}: {message}");
                     Clients.Clients(connectionIDs).receivePendingMessage(senderID.Value, message);
                 }
                 else
                 {
-                    Console.WriteLine($"Sending general notification to {receiverID}: {message}");
-                    Clients.Clients(connectionIDs).receiveGeneralNotification(senderID.HasValue ? senderID.Value : 0, message);
+                    Console.WriteLine($"Sending general notification from {senderID.Value} to {receiverID}: {message}");
+                    Clients.Clients(connectionIDs).receiveGeneralNotification(senderID.Value, message);
                 }
             }
             else if (queueIfOffline)
@@ -238,7 +268,7 @@ public class NotificationHub : Hub
                             cmd.Parameters.AddWithValue("@Message", message);
                             cmd.Parameters.AddWithValue("@CreatedAt", DateTime.Now);
                             await cmd.ExecuteNonQueryAsync();
-                       //     Console.WriteLine($"Queued chat message for offline user {receiverID} from {senderID}");
+                            Console.WriteLine($"Queued chat message for offline user {receiverID} from {senderID}");
                         }
                     }
                 }
@@ -247,6 +277,39 @@ public class NotificationHub : Hub
                     await InsertGeneralNotificationAsync(receiverID, senderID, message);
                 }
             }
+        }
+    }
+
+    private async Task InsertGeneralNotificationForOnlineUsers(List<int> onlineUserIds, int? senderID, string message)
+    {
+        try
+        {
+            using (SqlConnection connection = new SqlConnection(connectionString))
+            {
+                await connection.OpenAsync();
+                string query = @"
+                INSERT INTO Notifications (ReceiverID, SenderID, MessageText, IsSeen, Timestamp)
+                VALUES (@ReceiverID, @SenderID, @MessageText, 0, GETDATE())";
+                using (SqlCommand cmd = new SqlCommand(query, connection))
+                {
+                    cmd.Parameters.AddWithValue("@SenderID", (object)senderID ?? DBNull.Value);
+                    cmd.Parameters.AddWithValue("@MessageText", message);
+
+                    foreach (int userId in onlineUserIds)
+                    {
+                        cmd.Parameters.Clear(); // Clear previous parameters
+                        cmd.Parameters.AddWithValue("@ReceiverID", userId);
+                        cmd.Parameters.AddWithValue("@SenderID", (object)senderID ?? DBNull.Value);
+                        cmd.Parameters.AddWithValue("@MessageText", message);
+                        await cmd.ExecuteNonQueryAsync();
+                        Console.WriteLine($"Inserted general notification for online user {userId}, SenderID: {senderID}");
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error inserting notification for online users: {ex.Message}\nStackTrace: {ex.StackTrace}");
         }
     }
     private async Task InsertGeneralNotificationAsync(int? receiverID, int? senderID, string messageText)
