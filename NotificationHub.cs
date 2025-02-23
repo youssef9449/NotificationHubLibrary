@@ -9,8 +9,8 @@ public class NotificationHub : Hub
 {
     private static readonly Dictionary<int, List<string>> _userConnections = new Dictionary<int, List<string>>();
     private static readonly object _connectionLock = new object();
-    //public static string connectionString = "Data Source=192.168.1.9;Initial Catalog=Users;User ID=sa;Password=123;";
-    public static string connectionString = "Data Source=192.168.1.11;Initial Catalog=Users;Trusted_Connection=True;";
+    public static string connectionString = "Data Source=192.168.1.9;Initial Catalog=Users;User ID=sa;Password=123;";
+    //public static string connectionString = "Data Source=192.168.1.11;Initial Catalog=Users;Trusted_Connection=True;";
     private static readonly string[] hrRoles = new string[] { "Human Resources" }; // Adjust based on your system
 
 
@@ -162,29 +162,80 @@ public class NotificationHub : Hub
 
     public async Task SendNotification(List<int> receiverIDs, string message, int? senderID = null, bool isChatMessage = false, bool queueIfOffline = false)
     {
-        if (isChatMessage && senderID.HasValue)
+        if (receiverIDs == null || !receiverIDs.Any())
         {
-            foreach (int receiverID in receiverIDs.Distinct())
+            if (isChatMessage && senderID.HasValue)
             {
-                // Skip if receiver is the sender
-                if (receiverID == senderID.Value)
+                Console.WriteLine($"Broadcasting chat message from {senderID.Value} to all online users: {message}");
+                var onlineUserIds = GetConnectedUserIDs(); // Get only online users
+                foreach (int userId in onlineUserIds)
                 {
-                    Console.WriteLine($"[Hub Debug] Skipping notification to sender {senderID.Value}");
-                    continue;
+                    if (senderID.HasValue && userId == senderID.Value)
+                    {
+                        Console.WriteLine($"Skipping chat message for sender {senderID.Value}");
+                        continue;
+                    }
+                    var connectionIDs = GetConnectionIDsByUserID(userId);
+                    if (connectionIDs != null && connectionIDs.Count > 0)
+                    {
+                        Clients.Clients(connectionIDs).receivePendingMessage(senderID.Value, message);
+                    }
+                }
+            }
+            else
+            {
+                Console.WriteLine($"Broadcasting general notification from {senderID ?? -1} to all online users: {message}");
+                var onlineUserIds = GetConnectedUserIDs(); // Get only online users
+                if (senderID.HasValue)
+                {
+                    onlineUserIds = onlineUserIds.Where(id => id != senderID.Value).ToList(); // Exclude sender
                 }
 
-                var connectionIDs = GetConnectionIDsByUserID(receiverID);
-
-                if (connectionIDs != null && connectionIDs.Count > 0)
+                if (onlineUserIds.Any())
                 {
-                    Console.WriteLine($"[Hub Debug] Sending message from {senderID.Value} to receiver {receiverID}");
-                    // Send only to the specific receiver's connections
-                    await Clients.Clients(connectionIDs).receivePendingMessage(senderID.Value, message);
+                    foreach (int userId in onlineUserIds)
+                    {
+                        var connectionIDs = GetConnectionIDsByUserID(userId);
+                        if (connectionIDs != null && connectionIDs.Count > 0)
+                        {
+                            Clients.Clients(connectionIDs).receiveGeneralNotification(senderID.Value, message);
+                        }
+                    }
+                    // Insert notification for online users only, excluding the sender
+                    await InsertGeneralNotificationForOnlineUsers(onlineUserIds, senderID, message);
                 }
-                else if (queueIfOffline)
+            }
+            return;
+        }
+
+        foreach (int receiverID in receiverIDs.Distinct())
+        {
+            // Explicitly exclude the sender from receiving their own message (chat or general)
+            if ((isChatMessage || !isChatMessage) && senderID.HasValue && receiverID == senderID.Value)
+            {
+                Console.WriteLine($"Skipping {(isChatMessage ? "chat" : "general")} message for sender {senderID.Value}");
+                continue;
+            }
+
+            var connectionIDs = GetConnectionIDsByUserID(receiverID);
+
+            if (connectionIDs != null && connectionIDs.Count > 0)
+            {
+                if (isChatMessage && senderID.HasValue)
                 {
-                    Console.WriteLine($"[Hub Debug] Queuing offline message for receiver {receiverID}");
-                    // Queue message for offline user
+                    //     Console.WriteLine($"Sending chat message from {senderID.Value} to {receiverID}: {message}");
+                    Clients.Clients(connectionIDs).receivePendingMessage(senderID.Value, message);
+                }
+                else
+                {
+                    Console.WriteLine($"Sending general notification from {senderID.Value} to {receiverID}: {message}");
+                    Clients.Clients(connectionIDs).receiveGeneralNotification(senderID.Value, message);
+                }
+            }
+            else if (queueIfOffline)
+            {
+                if (isChatMessage)
+                {
                     using (SqlConnection connection = new SqlConnection(connectionString))
                     {
                         await connection.OpenAsync();
@@ -193,18 +244,22 @@ public class NotificationHub : Hub
                             "VALUES (@SenderID, @ReceiverID, @Message, @CreatedAt, 0)",
                             connection))
                         {
-                            cmd.Parameters.AddWithValue("@SenderID", senderID.Value);
+                            cmd.Parameters.AddWithValue("@SenderID", senderID ?? (object)DBNull.Value);
                             cmd.Parameters.AddWithValue("@ReceiverID", receiverID);
                             cmd.Parameters.AddWithValue("@Message", message);
                             cmd.Parameters.AddWithValue("@CreatedAt", DateTime.Now);
                             await cmd.ExecuteNonQueryAsync();
+                            Console.WriteLine($"Queued chat message for offline user {receiverID} from {senderID}");
                         }
                     }
+                }
+                else
+                {
+                    await InsertGeneralNotificationAsync(receiverID, senderID, message);
                 }
             }
         }
     }
-
     private async Task InsertGeneralNotificationForOnlineUsers(List<int> onlineUserIds, int? senderID, string message)
     {
         try
@@ -266,10 +321,14 @@ public class NotificationHub : Hub
     {
         lock (_connectionLock)
         {
-            return _userConnections.TryGetValue(userID, out var connections) ? connections.ToList() : new List<string>();
+            if (_userConnections.TryGetValue(userID, out var connections))
+            {
+                Console.WriteLine($"Connections for {userID}: {string.Join(", ", connections)}");
+                return connections.ToList();
+            }
+            return new List<string>();
         }
     }
-
     public Dictionary<int, PendingMessageData> GetPendingMessageCounts(int receiverId)
     {
         var result = new Dictionary<int, PendingMessageData>();
@@ -277,14 +336,11 @@ public class NotificationHub : Hub
         {
             connection.Open();
             using (var cmd = new SqlCommand(
-                @"SELECT 
-                SenderID AS SenderId, 
-                COUNT(*) AS MessageCount, 
-                COALESCE(STRING_AGG(Message, '|'), '') AS Messages 
+                        @"SELECT SenderID, COUNT(*) AS MessageCount, COALESCE(STRING_AGG(Message, '|'), '') AS Messages 
               FROM PendingChatMessages 
-              WHERE ReceiverID = @ReceiverID AND IsDelivered = 0 
+              WHERE ReceiverID = @ReceiverID AND IsDelivered = 0 AND SenderID != @ReceiverID 
               GROUP BY SenderID",
-                connection))
+                        connection))
             {
                 cmd.Parameters.AddWithValue("@ReceiverID", receiverId);
                 using (var reader = cmd.ExecuteReader())
