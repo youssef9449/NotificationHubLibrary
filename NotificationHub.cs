@@ -178,7 +178,7 @@ public class NotificationHub : Hub
                 var connectionIDs = GetConnectionIDsByUserID(targetID);
                 if (connectionIDs != null && connectionIDs.Any())
                 {
-                    Console.WriteLine($"Sending chat message from {senderID} to {targetID}: {message}");
+                 //   Console.WriteLine($"Sending chat message from {senderID} to {targetID}: {message}");
                     Clients.Clients(connectionIDs).receivePendingMessage(senderID.Value, message); // Send only senderId and message
                 }
                 else if (queueIfOffline)
@@ -294,7 +294,7 @@ public class NotificationHub : Hub
         {
             if (_userConnections.TryGetValue(userID, out var connections))
             {
-                Console.WriteLine($"Connections for {userID}: {string.Join(", ", connections)}");
+         //       Console.WriteLine($"Connections for {userID}: {string.Join(", ", connections)}");
                 return connections.ToList();
             }
             return new List<string>();
