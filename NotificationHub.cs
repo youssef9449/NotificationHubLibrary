@@ -11,8 +11,7 @@ public class NotificationHub : Hub
     private static readonly object _connectionLock = new object();
     public static string connectionString = "Data Source=192.168.1.9;Initial Catalog=Users;User ID=sa;Password=123;";
     //public static string connectionString = "Data Source=192.168.1.11;Initial Catalog=Users;Trusted_Connection=True;";
-    private static readonly string[] hrRoles = new string[] { "Human Resources" }; // Adjust based on your system
-
+    private static readonly string[] hrRoles = new string[] { "HR" }; // Adjust based on your system
 
     public override Task OnConnected()
     {
@@ -32,55 +31,58 @@ public class NotificationHub : Hub
         await UpdateUserConnectionStatusAsync(userId, false);
         Clients.All.updateUserList();
     }
-    public void RegisterUserConnection(int userId)
-    {
-        lock (_connectionLock)
-        {
-            string connectionId = Context.ConnectionId;
-            if (!_userConnections.ContainsKey(userId))
-            {
-                _userConnections[userId] = new List<string>();
-            }
-            if (!_userConnections[userId].Contains(connectionId))
-            {
-                _userConnections[userId].Add(connectionId);
-                //Console.WriteLine($"Registered connection {connectionId} for user {userId}");
-            }
-        }
 
-        DeliverPendingChatMessages(userId);
-
-        using (var connection = new SqlConnection(connectionString))
+        public void RegisterUserConnection(int userId)
         {
-            connection.Open();
-            string query = "SELECT Role, Department FROM Users WHERE UserID = @UserID";
-            using (var cmd = new SqlCommand(query, connection))
+            lock (_connectionLock)
             {
-                cmd.Parameters.AddWithValue("@UserID", userId);
-                using (var reader = cmd.ExecuteReader())
+                string connectionId = Context.ConnectionId;
+                if (!_userConnections.ContainsKey(userId))
                 {
-                    if (reader.Read())
-                    {
-                        string role = reader.GetString(0);
-                        string department = reader.IsDBNull(1) ? "" : reader.GetString(1);
+                    _userConnections[userId] = new List<string>();
+                }
+                if (!_userConnections[userId].Contains(connectionId))
+                {
+                    _userConnections[userId].Add(connectionId);
+                    Console.WriteLine($"Registered connection {connectionId} for user {userId}");
+                }
+            }
 
-                        if (hrRoles.Any(r => role.Contains(r)))
+            DeliverPendingChatMessages(userId);
+
+            using (var connection = new SqlConnection(connectionString))
+            {
+                connection.Open();
+                string query = "SELECT Role, Department FROM Users WHERE UserID = @UserID";
+                using (var cmd = new SqlCommand(query, connection))
+                {
+                    cmd.Parameters.AddWithValue("@UserID", userId);
+                    using (var reader = cmd.ExecuteReader())
+                    {
+                        if (reader.Read())
+                        {
+                            string role = reader.GetString(0);
+                            string department = reader.IsDBNull(1) ? "" : reader.GetString(1);
+
+                        // Add users to "HR" group if their department is "Human Resources", regardless of role
+                        if (hrRoles.Any(r => role.Contains(r)) || department.Equals("Human Resources", StringComparison.OrdinalIgnoreCase))
                         {
                             Groups.Add(Context.ConnectionId, "HR");
                         }
 
+                        // Preserve role-based group logic for managers and team leaders
                         if (role == "Manager" || role == "Team Leader")
-                        {
-                            string[] departments = department.Split(new[] { " - " }, StringSplitOptions.RemoveEmptyEntries);
-                            foreach (string dept in departments)
                             {
-                                Groups.Add(Context.ConnectionId, "Manager_" + dept.Trim());
+                                string[] departments = department.Split(new[] { " - " }, StringSplitOptions.RemoveEmptyEntries);
+                                foreach (string dept in departments)
+                                {
+                                    Groups.Add(Context.ConnectionId, "Manager_" + dept.Trim());
+                                }
                             }
                         }
                     }
                 }
-            }
-        }
+            }   
 
         Clients.AllExcept(Context.ConnectionId).updateUserStatus(userId, true);
     }
@@ -178,7 +180,7 @@ public class NotificationHub : Hub
                 var connectionIDs = GetConnectionIDsByUserID(targetID);
                 if (connectionIDs != null && connectionIDs.Any())
                 {
-                 //   Console.WriteLine($"Sending chat message from {senderID} to {targetID}: {message}");
+                    Console.WriteLine($"Sending chat message from {senderID} to {targetID}: {message}");
                     Clients.Clients(connectionIDs).receivePendingMessage(senderID.Value, message); // Send only senderId and message
                 }
                 else if (queueIfOffline)
@@ -203,17 +205,25 @@ public class NotificationHub : Hub
         }
         else if (receiverIDs != null && receiverIDs.Any())
         {
+            // Handle broadcast to specific users (non-chat notification)
             foreach (int receiverID in receiverIDs.Distinct())
             {
+                if (senderID.HasValue && receiverID == senderID.Value)
+                {
+                    Console.WriteLine($"Skipping broadcast for sender {senderID} to {receiverID}");
+                    continue;
+                }
                 var connectionIDs = GetConnectionIDsByUserID(receiverID);
                 if (connectionIDs != null && connectionIDs.Any())
                 {
+                    Console.WriteLine($"Sending broadcast notification from {senderID ?? -1} to {receiverID}: {message}");
                     Clients.Clients(connectionIDs).receiveGeneralNotification(senderID.Value, message);
                 }
             }
         }
         else
         {
+            // Handle broadcast to all online users (non-chat notification)
             Console.WriteLine($"Broadcasting general notification from {senderID ?? -1} to all online users: {message}");
             var onlineUserIds = GetConnectedUserIDs();
             if (senderID.HasValue)
@@ -225,6 +235,7 @@ public class NotificationHub : Hub
                 var connectionIDs = GetConnectionIDsByUserID(userId);
                 if (connectionIDs != null && connectionIDs.Any())
                 {
+                    Console.WriteLine($"Sending to online user {userId} with connections: {string.Join(", ", connectionIDs)}");
                     Clients.Clients(connectionIDs).receiveGeneralNotification(senderID.Value, message);
                 }
             }
