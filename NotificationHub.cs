@@ -162,102 +162,73 @@ public class NotificationHub : Hub
 
     public async Task SendNotification(List<int> receiverIDs, string message, int? senderID = null, bool isChatMessage = false, bool queueIfOffline = false)
     {
-        if (receiverIDs == null || !receiverIDs.Any())
+        if (isChatMessage && senderID.HasValue)
         {
-            if (isChatMessage && senderID.HasValue)
+            // Get the chat partner (receiver) ID, ensuring it excludes the sender
+            int chatPartnerId = receiverIDs.FirstOrDefault(id => id != senderID.Value);
+            if (chatPartnerId == 0 || chatPartnerId == senderID.Value)
             {
-                Console.WriteLine($"Broadcasting chat message from {senderID.Value} to all online users: {message}");
-                var onlineUserIds = GetConnectedUserIDs(); // Get only online users
-                foreach (int userId in onlineUserIds)
-                {
-                    if (senderID.HasValue && userId == senderID.Value)
-                    {
-                        Console.WriteLine($"Skipping chat message for sender {senderID.Value}");
-                        continue;
-                    }
-                    var connectionIDs = GetConnectionIDsByUserID(userId);
-                    if (connectionIDs != null && connectionIDs.Count > 0)
-                    {
-                        Clients.Clients(connectionIDs).receivePendingMessage(senderID.Value, message);
-                    }
-                }
-            }
-            else
-            {
-                Console.WriteLine($"Broadcasting general notification from {senderID ?? -1} to all online users: {message}");
-                var onlineUserIds = GetConnectedUserIDs(); // Get only online users
-                if (senderID.HasValue)
-                {
-                    onlineUserIds = onlineUserIds.Where(id => id != senderID.Value).ToList(); // Exclude sender
-                }
-
-                if (onlineUserIds.Any())
-                {
-                    foreach (int userId in onlineUserIds)
-                    {
-                        var connectionIDs = GetConnectionIDsByUserID(userId);
-                        if (connectionIDs != null && connectionIDs.Count > 0)
-                        {
-                            Clients.Clients(connectionIDs).receiveGeneralNotification(senderID.Value, message);
-                        }
-                    }
-                    // Insert notification for online users only, excluding the sender
-                    await InsertGeneralNotificationForOnlineUsers(onlineUserIds, senderID, message);
-                }
-            }
-            return;
-        }
-
-        foreach (int receiverID in receiverIDs.Distinct())
-        {
-            // Explicitly exclude the sender from receiving their own message (chat or general)
-            if ((isChatMessage || !isChatMessage) && senderID.HasValue && receiverID == senderID.Value)
-            {
-                Console.WriteLine($"Skipping {(isChatMessage ? "chat" : "general")} message for sender {senderID.Value}");
-                continue;
+                Console.WriteLine($"Invalid chat partner ID for sender {senderID}. Skipping message.");
+                return;
             }
 
-            var connectionIDs = GetConnectionIDsByUserID(receiverID);
-
-            if (connectionIDs != null && connectionIDs.Count > 0)
+            var targetIDs = new List<int> { chatPartnerId };
+            foreach (int targetID in targetIDs.Distinct())
             {
-                if (isChatMessage && senderID.HasValue)
+                var connectionIDs = GetConnectionIDsByUserID(targetID);
+                if (connectionIDs != null && connectionIDs.Any())
                 {
-                    //     Console.WriteLine($"Sending chat message from {senderID.Value} to {receiverID}: {message}");
-                    Clients.Clients(connectionIDs).receivePendingMessage(senderID.Value, message);
+                    Console.WriteLine($"Sending chat message from {senderID} to {targetID}: {message}");
+                    Clients.Clients(connectionIDs).receivePendingMessage(senderID.Value, message); // Send only senderId and message
                 }
-                else
-                {
-                    Console.WriteLine($"Sending general notification from {senderID.Value} to {receiverID}: {message}");
-                    Clients.Clients(connectionIDs).receiveGeneralNotification(senderID.Value, message);
-                }
-            }
-            else if (queueIfOffline)
-            {
-                if (isChatMessage)
+                else if (queueIfOffline)
                 {
                     using (SqlConnection connection = new SqlConnection(connectionString))
                     {
                         await connection.OpenAsync();
                         using (var cmd = new SqlCommand(
-                            "INSERT INTO PendingChatMessages (SenderID, ReceiverID, Message, CreatedAt, IsDelivered) " +
-                            "VALUES (@SenderID, @ReceiverID, @Message, @CreatedAt, 0)",
+                            "INSERT INTO PendingChatMessages (SenderID, ReceiverID, Message, CreatedAt, IsDelivered) VALUES (@SenderID, @ReceiverID, @Message, @CreatedAt, 0)",
                             connection))
                         {
-                            cmd.Parameters.AddWithValue("@SenderID", senderID ?? (object)DBNull.Value);
-                            cmd.Parameters.AddWithValue("@ReceiverID", receiverID);
+                            cmd.Parameters.AddWithValue("@SenderID", senderID.Value);
+                            cmd.Parameters.AddWithValue("@ReceiverID", targetID);
                             cmd.Parameters.AddWithValue("@Message", message);
                             cmd.Parameters.AddWithValue("@CreatedAt", DateTime.Now);
                             await cmd.ExecuteNonQueryAsync();
-                            Console.WriteLine($"Queued chat message for offline user {receiverID} from {senderID}");
+                            Console.WriteLine($"Queued chat message for offline user {targetID} from {senderID}");
                         }
                     }
                 }
-                else
+            }
+        }
+        else if (receiverIDs != null && receiverIDs.Any())
+        {
+            foreach (int receiverID in receiverIDs.Distinct())
+            {
+                var connectionIDs = GetConnectionIDsByUserID(receiverID);
+                if (connectionIDs != null && connectionIDs.Any())
                 {
-                    await InsertGeneralNotificationAsync(receiverID, senderID, message);
+                    Clients.Clients(connectionIDs).receiveGeneralNotification(senderID.Value, message);
                 }
             }
+        }
+        else
+        {
+            Console.WriteLine($"Broadcasting general notification from {senderID ?? -1} to all online users: {message}");
+            var onlineUserIds = GetConnectedUserIDs();
+            if (senderID.HasValue)
+            {
+                onlineUserIds = onlineUserIds.Except(new[] { senderID.Value }).ToList();
+            }
+            foreach (int userId in onlineUserIds)
+            {
+                var connectionIDs = GetConnectionIDsByUserID(userId);
+                if (connectionIDs != null && connectionIDs.Any())
+                {
+                    Clients.Clients(connectionIDs).receiveGeneralNotification(senderID.Value, message);
+                }
+            }
+            await InsertGeneralNotificationForOnlineUsers(onlineUserIds, senderID, message);
         }
     }
     private async Task InsertGeneralNotificationForOnlineUsers(List<int> onlineUserIds, int? senderID, string message)
