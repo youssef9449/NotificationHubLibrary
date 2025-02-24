@@ -33,56 +33,81 @@ public class NotificationHub : Hub
     }
 
     public void RegisterUserConnection(int userId)
+    {
+        lock (_connectionLock)
         {
-            lock (_connectionLock)
+            string connectionId = Context.ConnectionId;
+            if (!_userConnections.ContainsKey(userId))
             {
-                string connectionId = Context.ConnectionId;
-                if (!_userConnections.ContainsKey(userId))
-                {
-                    _userConnections[userId] = new List<string>();
-                }
-                if (!_userConnections[userId].Contains(connectionId))
-                {
-                    _userConnections[userId].Add(connectionId);
-                   // Console.WriteLine($"Registered connection {connectionId} for user {userId}");
-                }
+                _userConnections[userId] = new List<string>();
             }
-
-            DeliverPendingChatMessages(userId);
-
-            using (var connection = new SqlConnection(connectionString))
+            if (!_userConnections[userId].Contains(connectionId))
             {
-                connection.Open();
-                string query = "SELECT Role, Department FROM Users WHERE UserID = @UserID";
-                using (var cmd = new SqlCommand(query, connection))
-                {
-                    cmd.Parameters.AddWithValue("@UserID", userId);
-                    using (var reader = cmd.ExecuteReader())
-                    {
-                        if (reader.Read())
-                        {
-                            string role = reader.GetString(0);
-                            string department = reader.IsDBNull(1) ? "" : reader.GetString(1);
+                _userConnections[userId].Add(connectionId);
+            //    Console.WriteLine($"Registered connection {connectionId} for user {userId}");
+            }
+        }
 
-                        // Add users to "HR" group if their department is "Human Resources", regardless of role
+        // Add to the "global" group for all users
+        Groups.Add(Context.ConnectionId, "global");
+        Console.WriteLine($"User {userId} added to 'global' group");
+
+        DeliverPendingChatMessages(userId);
+
+        using (var connection = new SqlConnection(connectionString))
+        {
+            connection.Open();
+            string query = "SELECT Role, Department FROM Users WHERE UserID = @UserID";
+            using (var cmd = new SqlCommand(query, connection))
+            {
+                cmd.Parameters.AddWithValue("@UserID", userId);
+                using (var reader = cmd.ExecuteReader())
+                {
+                    if (reader.Read())
+                    {
+                        string role = reader.GetString(0);
+                        string department = reader.IsDBNull(1) ? "" : reader.GetString(1).Trim();
+
+                      //  // Add to department-specific groups (split by " - " if multiple departments)
+                      //  if (!string.IsNullOrEmpty(department))
+                      //  {
+                      //      string[] departments = department.Split(new[] { " - " }, StringSplitOptions.RemoveEmptyEntries);
+                      //      foreach (string dept in departments)
+                      //      {
+                      //          string deptGroup = dept.Trim();
+                      //          if (!string.IsNullOrEmpty(deptGroup))
+                      //          {
+                      //              Groups.Add(Context.ConnectionId, deptGroup);
+                      ////              Console.WriteLine($"User {userId} added to '{deptGroup}' group");
+                      //          }
+                      //      }
+                      //  }
+
+                        // Add users to "HR" group if their role or department is "Human Resources"
                         if (hrRoles.Any(r => role.Contains(r)) || department.Equals("Human Resources", StringComparison.OrdinalIgnoreCase))
                         {
                             Groups.Add(Context.ConnectionId, "HR");
+                         //   Console.WriteLine($"User {userId} added to 'HR' group");
                         }
 
                         // Preserve role-based group logic for managers and team leaders
                         if (role == "Manager" || role == "Team Leader")
+                        {
+                            string[] managerDepartments = department.Split(new[] { " - " }, StringSplitOptions.RemoveEmptyEntries);
+                            foreach (string dept in managerDepartments)
                             {
-                                string[] departments = department.Split(new[] { " - " }, StringSplitOptions.RemoveEmptyEntries);
-                                foreach (string dept in departments)
+                                string deptGroup = "Manager_" + dept.Trim();
+                                if (!string.IsNullOrEmpty(dept))
                                 {
-                                    Groups.Add(Context.ConnectionId, "Manager_" + dept.Trim());
+                                    Groups.Add(Context.ConnectionId, deptGroup);
+                         //           Console.WriteLine($"User {userId} added to '{deptGroup}' group");
                                 }
                             }
                         }
                     }
                 }
-            }   
+            }
+        }
 
         Clients.AllExcept(Context.ConnectionId).updateUserStatus(userId, true);
     }
@@ -442,6 +467,60 @@ public class NotificationHub : Hub
             }
         }
     }
+
+    // New method to send global chat messages
+    public async Task SendGlobalChatMessage(string messageId, string message, int senderId)
+    {
+        // Broadcast the message to all users in the "global" group
+        await Clients.Group("global").receiveGlobalChatMessage(messageId, senderId, message);
+        // Save the message to the database
+        await SaveGlobalChatMessage(messageId, senderId, message);
+    }
+
+    // Helper method to save messages to the database
+    private async Task SaveGlobalChatMessage(string messageId, int senderId, string message)
+    {
+        using (SqlConnection connection = new SqlConnection(connectionString))
+        {
+            await connection.OpenAsync();
+            string query = "INSERT INTO GlobalChatMessages (MessageID, SenderID, Message, Timestamp) " +
+                          "VALUES (@MessageID, @SenderID, @Message, @Timestamp)";
+            using (SqlCommand cmd = new SqlCommand(query, connection))
+            {
+                cmd.Parameters.AddWithValue("@MessageID", messageId);
+                cmd.Parameters.AddWithValue("@SenderID", senderId);
+                cmd.Parameters.AddWithValue("@Message", message);
+                cmd.Parameters.AddWithValue("@Timestamp", DateTime.Now);
+                await cmd.ExecuteNonQueryAsync();
+            }
+        }
+    }
+    public async Task SendDepartmentChatMessage(string messageId, string message, int senderId, string department)
+    {
+        await Clients.Group(department).receiveDepartmentChatMessage(messageId, senderId, message);
+        await SaveDepartmentChatMessage(messageId, senderId, message, department);
+    }
+
+    private async Task SaveDepartmentChatMessage(string messageId, int senderId, string message, string department)
+    {
+        using (SqlConnection connection = new SqlConnection(connectionString))
+        {
+            await connection.OpenAsync();
+            string query = "INSERT INTO DepartmentChatMessages (MessageID, SenderID, Message, Department, Timestamp) " +
+                          "VALUES (@MessageID, @SenderID, @Message, @Department, @Timestamp)";
+            using (SqlCommand cmd = new SqlCommand(query, connection))
+            {
+                cmd.Parameters.AddWithValue("@MessageID", messageId);
+                cmd.Parameters.AddWithValue("@SenderID", senderId);
+                cmd.Parameters.AddWithValue("@Message", message);
+                cmd.Parameters.AddWithValue("@Department", department);
+                cmd.Parameters.AddWithValue("@Timestamp", DateTime.Now);
+                await cmd.ExecuteNonQueryAsync();
+            }
+        }
+    }
+
+
     /* public void RegisterUserConnection(int userID)
  {
      lock (_connectionLock)
