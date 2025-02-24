@@ -10,7 +10,7 @@ public class NotificationHub : Hub
     private static readonly Dictionary<int, List<string>> _userConnections = new Dictionary<int, List<string>>();
     private static readonly object _connectionLock = new object();
     //public static string connectionString = "Data Source=192.168.1.9;Initial Catalog=Users;User ID=sa;Password=123;";
-    public static string connectionString = "Data Source=192.168.1.11;Initial Catalog=Users;Trusted_Connection=True;";
+    public static string connectionString = "Data Source=192.168.1.93;Initial Catalog=Users;Trusted_Connection=True;";
     private static readonly string[] hrRoles = new string[] { "HR" }; // Adjust based on your system
 
     public override Task OnConnected()
@@ -32,7 +32,7 @@ public class NotificationHub : Hub
         Clients.All.updateUserList();
     }
 
-        public void RegisterUserConnection(int userId)
+    public void RegisterUserConnection(int userId)
         {
             lock (_connectionLock)
             {
@@ -44,7 +44,7 @@ public class NotificationHub : Hub
                 if (!_userConnections[userId].Contains(connectionId))
                 {
                     _userConnections[userId].Add(connectionId);
-                    Console.WriteLine($"Registered connection {connectionId} for user {userId}");
+                   // Console.WriteLine($"Registered connection {connectionId} for user {userId}");
                 }
             }
 
@@ -180,7 +180,7 @@ public class NotificationHub : Hub
                 var connectionIDs = GetConnectionIDsByUserID(targetID);
                 if (connectionIDs != null && connectionIDs.Any())
                 {
-                    Console.WriteLine($"Sending chat message from {senderID} to {targetID}: {message}");
+                   // Console.WriteLine($"Sending chat message from {senderID} to {targetID}: {message}");
                     Clients.Clients(connectionIDs).receivePendingMessage(senderID.Value, message); // Send only senderId and message
                 }
                 else if (queueIfOffline)
@@ -210,7 +210,7 @@ public class NotificationHub : Hub
             {
                 if (senderID.HasValue && receiverID == senderID.Value)
                 {
-                    Console.WriteLine($"Skipping broadcast for sender {senderID} to {receiverID}");
+                   // Console.WriteLine($"Skipping broadcast for sender {senderID} to {receiverID}");
                     continue;
                 }
                 var connectionIDs = GetConnectionIDsByUserID(receiverID);
