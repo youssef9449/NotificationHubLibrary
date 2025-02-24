@@ -50,7 +50,7 @@ public class NotificationHub : Hub
 
         // Add to the "global" group for all users
         Groups.Add(Context.ConnectionId, "global");
-        Console.WriteLine($"User {userId} added to 'global' group");
+       // Console.WriteLine($"User {userId} added to 'global' group");
 
         DeliverPendingChatMessages(userId);
 
