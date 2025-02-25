@@ -10,8 +10,8 @@ public class NotificationHub : Hub
     private static readonly Dictionary<int, List<string>> _userConnections = new Dictionary<int, List<string>>();
     private static readonly object _connectionLock = new object();
     //public static string connectionString = "Data Source=192.168.1.11;Initial Catalog=Users;Trusted_Connection=True;";
-    //public static string connectionString = "Data Source=192.168.1.9;Initial Catalog=Users;User ID=sa;Password=123;";
-    public static string connectionString = "Data Source=192.168.1.93;Initial Catalog=Users;Trusted_Connection=True;";
+    public static string connectionString = "Data Source=192.168.1.9;Initial Catalog=Users;User ID=sa;Password=123;";
+    //public static string connectionString = "Data Source=192.168.1.93;Initial Catalog=Users;Trusted_Connection=True;";
     private static readonly string[] hrRoles = new string[] { "HR" }; // Adjust based on your system
 
     public override Task OnConnected()
@@ -19,6 +19,7 @@ public class NotificationHub : Hub
         // Avoid full refresh here, handled in RegisterUserConnection
         return base.OnConnected();
     }
+    // 1. First, in your Hub class, modify DisconnectUser method:
     public async Task DisconnectUser(int userId)
     {
         lock (_connectionLock)
@@ -30,7 +31,8 @@ public class NotificationHub : Hub
         }
 
         await UpdateUserConnectionStatusAsync(userId, false);
-        Clients.All.updateUserList();
+        // Notice the change here - we now call updateUserStatus instead of updateUserList
+        Clients.All.updateUserStatus(userId, false);
     }
 
     public void RegisterUserConnection(int userId)
@@ -112,26 +114,27 @@ public class NotificationHub : Hub
 
         Clients.AllExcept(Context.ConnectionId).updateUserStatus(userId, true);
     }
-    public async Task NotifyNewRequest(string department)
+    // Update the NotifyNewRequest method to pass the requester's ID
+    public async Task NotifyNewRequest(string department, int requesterId)
     {
         // Notify HR and manager groups to refresh requests and notifications
+        // while passing the ID of the user who created the request
         await Clients.Group("HR").RefreshRequests();
         await Clients.Group("Manager_" + department).RefreshRequests();
-        await Clients.Group("HR").RefreshNotifications();
-        await Clients.Group("Manager_" + department).RefreshNotifications();
+        await Clients.Group("HR").RefreshNotifications(requesterId);
+        await Clients.Group("Manager_" + department).RefreshNotifications(requesterId);
     }
-    public async Task NotifyNewRequestWithDetails(string department, int requestId, string userFullName, string requestType, string requestFromDay, string requestStatus)
+    public async Task NotifyNewRequestWithDetails(string department, int requestId, string userFullName, string requestType, string requestFromDay, string requestStatus, int requesterId)
     {
         await Clients.Group("HR").AddNewRequest(requestId, userFullName, requestType, requestFromDay, requestStatus);
         await Clients.Group("Manager_" + department).AddNewRequest(requestId, userFullName, requestType, requestFromDay, requestStatus);
-        await Clients.Group("HR").RefreshNotifications();
-        await Clients.Group("Manager_" + department).RefreshNotifications();
+        await Clients.Group("HR").RefreshNotifications(requesterId);
+        await Clients.Group("Manager_" + department).RefreshNotifications(requesterId);
     }
     public override Task OnDisconnected(bool stopCalled)
     {
         string connectionID = Context.ConnectionId;
         int? disconnectedUserID = null;
-
         lock (_connectionLock)
         {
             foreach (var userID in _userConnections.Keys.ToList())
@@ -148,13 +151,12 @@ public class NotificationHub : Hub
                 }
             }
         }
-
         if (disconnectedUserID.HasValue)
         {
-            DisconnectUser(disconnectedUserID.Value); // Keep as non-async for compatibility
-            Clients.All.updateUserStatus(disconnectedUserID.Value, false);
+            DisconnectUser(disconnectedUserID.Value); // This already calls updateUserStatus
+                                                      // Remove this redundant line:
+                                                      // Clients.All.updateUserStatus(disconnectedUserID.Value, false);
         }
-
         return base.OnDisconnected(stopCalled);
     }
 
