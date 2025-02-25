@@ -542,6 +542,7 @@ public class NotificationHub : Hub
      DeliverPendingChatMessages(userID);
      UpdateUserConnectionStatus(userID, true); // Add this
  }*/
+
     public class PendingMessageData
     {
         public int Count { get; set; }
