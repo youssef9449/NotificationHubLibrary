@@ -9,9 +9,9 @@ public class NotificationHub : Hub
 {
     private static readonly Dictionary<int, List<string>> _userConnections = new Dictionary<int, List<string>>();
     private static readonly object _connectionLock = new object();
-    //public static string connectionString = "Data Source=192.168.1.11;Initial Catalog=Users;Trusted_Connection=True;";
+    public static string connectionString = "Data Source=192.168.1.11;Initial Catalog=Users;Trusted_Connection=True;";
     //public static string connectionString = "Data Source=192.168.1.9;Initial Catalog=Users;User ID=sa;Password=123;";
-    public static string connectionString = "Data Source=192.168.1.89;Initial Catalog=Users;Trusted_Connection=True;";
+    //public static string connectionString = "Data Source=192.168.1.89;Initial Catalog=Users;Trusted_Connection=True;";
     private static readonly string[] hrRoles = new string[] { "HR" }; // Adjust based on your system
 
     public override Task OnConnected()
