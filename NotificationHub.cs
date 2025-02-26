@@ -10,8 +10,8 @@ public class NotificationHub : Hub
     private static readonly Dictionary<int, List<string>> _userConnections = new Dictionary<int, List<string>>();
     private static readonly object _connectionLock = new object();
     //public static string connectionString = "Data Source=192.168.1.11;Initial Catalog=Users;Trusted_Connection=True;";
-    public static string connectionString = "Data Source=192.168.1.9;Initial Catalog=Users;User ID=sa;Password=123;";
-    //public static string connectionString = "Data Source=192.168.1.93;Initial Catalog=Users;Trusted_Connection=True;";
+    //public static string connectionString = "Data Source=192.168.1.9;Initial Catalog=Users;User ID=sa;Password=123;";
+    public static string connectionString = "Data Source=192.168.1.89;Initial Catalog=Users;Trusted_Connection=True;";
     private static readonly string[] hrRoles = new string[] { "HR" }; // Adjust based on your system
 
     public override Task OnConnected()
@@ -34,7 +34,6 @@ public class NotificationHub : Hub
         // Notice the change here - we now call updateUserStatus instead of updateUserList
         Clients.All.updateUserStatus(userId, false);
     }
-
     public void RegisterUserConnection(int userId)
     {
         lock (_connectionLock)
@@ -159,7 +158,6 @@ public class NotificationHub : Hub
         }
         return base.OnDisconnected(stopCalled);
     }
-
     private async Task UpdateUserConnectionStatusAsync(int userId, bool isConnected)
     {
         try
@@ -189,7 +187,6 @@ public class NotificationHub : Hub
             return _userConnections.Keys.ToList();
         }
     }
-
     public async Task SendNotification(List<int> receiverIDs, string message, int? senderID = null, bool isChatMessage = false, bool queueIfOffline = false)
     {
         if (isChatMessage && senderID.HasValue)
@@ -371,7 +368,6 @@ public class NotificationHub : Hub
         }
         return result;
     }
-
     private void DeliverPendingChatMessages(int userID)
     {
         try
@@ -402,7 +398,6 @@ public class NotificationHub : Hub
             Console.WriteLine($"Error delivering pending chat messages: {ex.Message}");
         }
     }
-
     public List<string> GetPendingMessages(int receiverId, int senderId)
     {
         var messages = new List<string>();
@@ -427,7 +422,6 @@ public class NotificationHub : Hub
         }
         return messages;
     }
-
     public void MarkMessagesAsDelivered(int senderId, int receiverId)
     {
         try
@@ -460,17 +454,25 @@ public class NotificationHub : Hub
     }
     public void NotifyAffectedUsers(List<int> userIds)
     {
+        // Get the connection ID of the caller to avoid notifying the sender
+        string callerConnectionId = Context.ConnectionId;
+
         foreach (int userId in userIds)
         {
             var connectionIDs = GetConnectionIDsByUserID(userId);
             if (connectionIDs != null && connectionIDs.Count > 0)
             {
-                //Console.WriteLine($"Notifying user {userId} to refresh requests.");
-                Clients.Clients(connectionIDs).RefreshRequests();
+                // Filter out the caller's connection ID to prevent self-notification
+                var filteredConnectionIDs = connectionIDs.Where(id => id != callerConnectionId).ToList();
+
+                if (filteredConnectionIDs.Any())
+                {
+                    //Console.WriteLine($"Notifying user {userId} to refresh requests.");
+                    Clients.Clients(filteredConnectionIDs).RefreshRequests();
+                }
             }
         }
     }
-
     // New method to send global chat messages
     public async Task SendGlobalChatMessage(string messageId, string message, int senderId)
     {
@@ -479,7 +481,6 @@ public class NotificationHub : Hub
         // Save the message to the database
         await SaveGlobalChatMessage(messageId, senderId, message);
     }
-
     // Helper method to save messages to the database
     private async Task SaveGlobalChatMessage(string messageId, int senderId, string message)
     {
@@ -503,7 +504,6 @@ public class NotificationHub : Hub
         await Clients.Group(department).receiveDepartmentChatMessage(messageId, senderId, message);
         await SaveDepartmentChatMessage(messageId, senderId, message, department);
     }
-
     private async Task SaveDepartmentChatMessage(string messageId, int senderId, string message, string department)
     {
         using (SqlConnection connection = new SqlConnection(connectionString))
