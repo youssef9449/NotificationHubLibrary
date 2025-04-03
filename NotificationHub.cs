@@ -1,4 +1,5 @@
 ﻿using Microsoft.AspNet.SignalR;
+using NotificationHubLibrary;
 using System;
 using System.Collections.Generic;
 using System.Data.SqlClient;
@@ -9,11 +10,294 @@ public class NotificationHub : Hub
 {
     private static readonly Dictionary<int, List<string>> _userConnections = new Dictionary<int, List<string>>();
     private static readonly object _connectionLock = new object();
-    public static string connectionString = "Data Source=192.168.1.11;Initial Catalog=Users;Trusted_Connection=True;";
-    //public static string connectionString = "Data Source=192.168.1.9;Initial Catalog=Users;User ID=sa;Password=123;";
-    //public static string connectionString = "Data Source=192.168.1.89;Initial Catalog=Users;Trusted_Connection=True;";
+
     private static readonly string[] hrRoles = new string[] { "HR" }; // Adjust based on your system
 
+    #region Chat Methods
+    public async Task SendNotification(List<int> receiverIDs, string message, int? senderID = null, bool isChatMessage = false, bool queueIfOffline = false)
+    {
+        if (isChatMessage && senderID.HasValue)
+        {
+            // Get the chat partner (receiver) ID, ensuring it excludes the sender
+            int chatPartnerId = receiverIDs.FirstOrDefault(id => id != senderID.Value);
+            if (chatPartnerId == 0 || chatPartnerId == senderID.Value)
+            {
+                Console.WriteLine($"Invalid chat partner ID for sender {senderID}. Skipping message.");
+                return;
+            }
+
+            var targetIDs = new List<int> { chatPartnerId };
+            foreach (int targetID in targetIDs.Distinct())
+            {
+                var connectionIDs = GetConnectionIDsByUserID(targetID);
+                if (connectionIDs != null && connectionIDs.Any())
+                {
+                    // Console.WriteLine($"Sending chat message from {senderID} to {targetID}: {message}");
+                    Clients.Clients(connectionIDs).receivePendingMessage(senderID.Value, message); // Send only senderId and message
+                }
+                else if (queueIfOffline)
+                {
+                    using (SqlConnection connection = Database.getConnection())
+                    {
+                        await connection.OpenAsync();
+                        using (var cmd = new SqlCommand(
+                            "INSERT INTO PendingChatMessages (SenderID, ReceiverID, Message, CreatedAt, IsDelivered) VALUES (@SenderID, @ReceiverID, @Message, @CreatedAt, 0)",
+                            connection))
+                        {
+                            cmd.Parameters.AddWithValue("@SenderID", senderID.Value);
+                            cmd.Parameters.AddWithValue("@ReceiverID", targetID);
+                            cmd.Parameters.AddWithValue("@Message", message);
+                            cmd.Parameters.AddWithValue("@CreatedAt", DateTime.Now);
+                            await cmd.ExecuteNonQueryAsync();
+                            //Console.WriteLine($"Queued chat message for offline user {targetID} from {senderID}");
+                        }
+                    }
+                }
+            }
+        }
+        else if (receiverIDs != null && receiverIDs.Any())
+        {
+            // Handle broadcast to specific users (non-chat notification)
+            foreach (int receiverID in receiverIDs.Distinct())
+            {
+                if (senderID.HasValue && receiverID == senderID.Value)
+                {
+                    // Console.WriteLine($"Skipping broadcast for sender {senderID} to {receiverID}");
+                    continue;
+                }
+                var connectionIDs = GetConnectionIDsByUserID(receiverID);
+                if (connectionIDs != null && connectionIDs.Any())
+                {
+                    Console.WriteLine($"Sending broadcast notification from {senderID ?? -1} to {receiverID}: {message}");
+                    Clients.Clients(connectionIDs).receiveGeneralNotification(senderID.Value, message);
+                }
+            }
+        }
+        else
+        {
+            // Handle broadcast to all online users (non-chat notification)
+            Console.WriteLine($"Broadcasting general notification from {senderID ?? -1} to all online users: {message}");
+            var onlineUserIds = GetConnectedUserIDs();
+            if (senderID.HasValue)
+            {
+                onlineUserIds = onlineUserIds.Except(new[] { senderID.Value }).ToList();
+            }
+            foreach (int userId in onlineUserIds)
+            {
+                var connectionIDs = GetConnectionIDsByUserID(userId);
+                if (connectionIDs != null && connectionIDs.Any())
+                {
+                    Console.WriteLine($"Sending to online user {userId} with connections: {string.Join(", ", connectionIDs)}");
+                    Clients.Clients(connectionIDs).receiveGeneralNotification(senderID.Value, message);
+                }
+            }
+            await InsertGeneralNotificationForOnlineUsers(onlineUserIds, senderID, message);
+        }
+    }
+    public Dictionary<int, PendingMessageData> GetPendingMessageCounts(int receiverId)
+    {
+        var result = new Dictionary<int, PendingMessageData>();
+        using (var connection = Database.getConnection())
+        {
+            connection.Open();
+            using (var cmd = new SqlCommand(
+                        @"SELECT SenderID, COUNT(*) AS MessageCount, COALESCE(STRING_AGG(Message, '|'), '') AS Messages 
+              FROM PendingChatMessages 
+              WHERE ReceiverID = @ReceiverID AND IsDelivered = 0 AND SenderID != @ReceiverID 
+              GROUP BY SenderID",
+                        connection))
+            {
+                cmd.Parameters.AddWithValue("@ReceiverID", receiverId);
+                using (var reader = cmd.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        var senderId = reader.GetInt32(reader.GetOrdinal("SenderId"));
+                        var count = reader.GetInt32(reader.GetOrdinal("MessageCount"));
+                        var messages = reader.GetString(reader.GetOrdinal("Messages"));
+                        result[senderId] = new PendingMessageData
+                        {
+                            Count = count,
+                            Messages = messages.Split('|').ToList()
+                        };
+                    }
+                }
+            }
+        }
+        return result;
+    }
+    private void DeliverPendingChatMessages(int userID)
+    {
+        try
+        {
+            using (var connection = Database.getConnection())
+            {
+                connection.Open();
+                using (var cmd = new SqlCommand(
+                    "SELECT NotificationID, SenderID, Message FROM PendingChatMessages " +
+                    "WHERE ReceiverID = @ReceiverID AND IsDelivered = 0 " +
+                    "ORDER BY CreatedAt ASC", connection))
+                {
+                    cmd.Parameters.AddWithValue("@ReceiverID", userID);
+                    using (var reader = cmd.ExecuteReader())
+                    {
+                        while (reader.Read())
+                        {
+                            int senderID = reader.GetInt32(1);
+                            string message = reader.GetString(2);
+                            Clients.Clients(GetConnectionIDsByUserID(userID)).receivePendingMessage(senderID, message);
+                        }
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error delivering pending chat messages: {ex.Message}");
+        }
+    }
+    public List<string> GetPendingMessages(int receiverId, int senderId)
+    {
+        var messages = new List<string>();
+        using (var connection = Database.getConnection())
+        {
+            connection.Open();
+            using (var cmd = new SqlCommand(
+                "SELECT Message FROM PendingChatMessages " +
+                "WHERE ReceiverId = @ReceiverId AND SenderId = @SenderId",
+                connection))
+            {
+                cmd.Parameters.AddWithValue("@ReceiverId", receiverId);
+                cmd.Parameters.AddWithValue("@SenderId", senderId);
+                using (var reader = cmd.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        messages.Add(reader["Message"].ToString());
+                    }
+                }
+            }
+        }
+        return messages;
+    }
+    public void MarkMessagesAsDelivered(int senderId, int receiverId)
+    {
+        try
+        {
+            using (var connection = Database.getConnection())
+            {
+                connection.Open();
+                using (var cmd = new SqlCommand(
+                    @"UPDATE PendingChatMessages 
+                  SET IsDelivered = 1, 
+                      DeliveredAt = GETDATE() 
+                  WHERE SenderID = @SenderID 
+                    AND ReceiverID = @ReceiverID 
+                    AND IsDelivered = 0",
+                    connection))
+                {
+                    cmd.Parameters.AddWithValue("@SenderID", senderId);
+                    cmd.Parameters.AddWithValue("@ReceiverID", receiverId);
+                    cmd.ExecuteNonQuery();
+                }
+            }
+            // Notify clients to update message counts.
+            Clients.All.updateMessageCounts(receiverId, senderId, 0);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error in MarkMessagesAsDelivered: {ex.Message}\nStackTrace: {ex.StackTrace}");
+            throw; // Propagate the error to the client for debugging.
+        }
+    }
+    public void MarkMessagesAsRead(int senderId, int receiverId)
+    {
+        try
+        {
+            using (var connection = Database.getConnection())
+            {
+                connection.Open();
+                using (var cmd = new SqlCommand(
+                    @"UPDATE Messages 
+                  SET IsRead = 1, IsDelivered = 1
+                  WHERE SenderID = @SenderID 
+                    AND ReceiverID = @ReceiverID 
+                    AND IsRead = 0",
+                    connection))
+                {
+                    cmd.Parameters.AddWithValue("@SenderID", senderId);
+                    cmd.Parameters.AddWithValue("@ReceiverID", receiverId);
+                    cmd.ExecuteNonQuery();
+                }
+            }
+            // Notify clients to update message counts.
+            Clients.All.updateMessageCounts(receiverId, senderId, 0);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error in MarkMessagesAsRead: {ex.Message}\nStackTrace: {ex.StackTrace}");
+            throw; // Propagate the error to the client for debugging.
+        }
+    }
+    public List<int> GetConnectedUserIDs()
+    {
+        lock (_connectionLock)
+        {
+            return _userConnections.Keys.ToList();
+        }
+    }
+    // New method to send global chat messages
+    //public async Task SendGlobalChatMessage(string messageId, string message, int senderId)
+    //{
+    //    // Broadcast the message to all users in the "global" group
+    //    await Clients.Group("global").receiveGlobalChatMessage(messageId, senderId, message);
+    //    // Save the message to the database
+    //    await SaveGlobalChatMessage(messageId, senderId, message);
+    //}
+    //// Helper method to save messages to the database
+    //private async Task SaveGlobalChatMessage(string messageId, int senderId, string message)
+    //{
+    //    using (SqlConnection connection = Database.getConnection())
+    //    {
+    //        await connection.OpenAsync();
+    //        string query = "INSERT INTO GlobalChatMessages (MessageID, SenderID, Message, Timestamp) " +
+    //                      "VALUES (@MessageID, @SenderID, @Message, @Timestamp)";
+    //        using (SqlCommand cmd = new SqlCommand(query, connection))
+    //        {
+    //            cmd.Parameters.AddWithValue("@MessageID", messageId);
+    //            cmd.Parameters.AddWithValue("@SenderID", senderId);
+    //            cmd.Parameters.AddWithValue("@Message", message);
+    //            cmd.Parameters.AddWithValue("@Timestamp", DateTime.Now);
+    //            await cmd.ExecuteNonQueryAsync();
+    //        }
+    //    }
+    //}
+    //public async Task SendDepartmentChatMessage(string messageId, string message, int senderId, string department)
+    //{
+    //    await Clients.Group(department).receiveDepartmentChatMessage(messageId, senderId, message);
+    //    await SaveDepartmentChatMessage(messageId, senderId, message, department);
+    //}
+    //private async Task SaveDepartmentChatMessage(string messageId, int senderId, string message, string department)
+    //{
+    //    using (SqlConnection connection = Database.getConnection())
+    //    {
+    //        await connection.OpenAsync();
+    //        string query = "INSERT INTO DepartmentChatMessages (MessageID, SenderID, Message, Department, Timestamp) " +
+    //                      "VALUES (@MessageID, @SenderID, @Message, @Department, @Timestamp)";
+    //        using (SqlCommand cmd = new SqlCommand(query, connection))
+    //        {
+    //            cmd.Parameters.AddWithValue("@MessageID", messageId);
+    //            cmd.Parameters.AddWithValue("@SenderID", senderId);
+    //            cmd.Parameters.AddWithValue("@Message", message);
+    //            cmd.Parameters.AddWithValue("@Department", department);
+    //            cmd.Parameters.AddWithValue("@Timestamp", DateTime.Now);
+    //            await cmd.ExecuteNonQueryAsync();
+    //        }
+    //    }
+    //}
+    #endregion
+
+    #region User Connection Methods
     public override Task OnConnected()
     {
         // Avoid full refresh here, handled in RegisterUserConnection
@@ -46,17 +330,17 @@ public class NotificationHub : Hub
             if (!_userConnections[userId].Contains(connectionId))
             {
                 _userConnections[userId].Add(connectionId);
-            //    Console.WriteLine($"Registered connection {connectionId} for user {userId}");
+                //    Console.WriteLine($"Registered connection {connectionId} for user {userId}");
             }
         }
 
         // Add to the "global" group for all users
         Groups.Add(Context.ConnectionId, "global");
-       // Console.WriteLine($"User {userId} added to 'global' group");
+        // Console.WriteLine($"User {userId} added to 'global' group");
 
         DeliverPendingChatMessages(userId);
 
-        using (var connection = new SqlConnection(connectionString))
+        using (var connection = Database.getConnection())
         {
             connection.Open();
             string query = "SELECT Role, Department FROM Users WHERE UserID = @UserID";
@@ -70,26 +354,26 @@ public class NotificationHub : Hub
                         string role = reader.GetString(0);
                         string department = reader.IsDBNull(1) ? "" : reader.GetString(1).Trim();
 
-                      //  // Add to department-specific groups (split by " - " if multiple departments)
-                      //  if (!string.IsNullOrEmpty(department))
-                      //  {
-                      //      string[] departments = department.Split(new[] { " - " }, StringSplitOptions.RemoveEmptyEntries);
-                      //      foreach (string dept in departments)
-                      //      {
-                      //          string deptGroup = dept.Trim();
-                      //          if (!string.IsNullOrEmpty(deptGroup))
-                      //          {
-                      //              Groups.Add(Context.ConnectionId, deptGroup);
-                      ////              Console.WriteLine($"User {userId} added to '{deptGroup}' group");
-                      //          }
-                      //      }
-                      //  }
+                        //  // Add to department-specific groups (split by " - " if multiple departments)
+                        //  if (!string.IsNullOrEmpty(department))
+                        //  {
+                        //      string[] departments = department.Split(new[] { " - " }, StringSplitOptions.RemoveEmptyEntries);
+                        //      foreach (string dept in departments)
+                        //      {
+                        //          string deptGroup = dept.Trim();
+                        //          if (!string.IsNullOrEmpty(deptGroup))
+                        //          {
+                        //              Groups.Add(Context.ConnectionId, deptGroup);
+                        ////              Console.WriteLine($"User {userId} added to '{deptGroup}' group");
+                        //          }
+                        //      }
+                        //  }
 
                         // Add users to "HR" group if their role or department is "Human Resources"
                         if (hrRoles.Any(r => role.Contains(r)) || department.Equals("Human Resources", StringComparison.OrdinalIgnoreCase))
                         {
                             Groups.Add(Context.ConnectionId, "HR");
-                         //   Console.WriteLine($"User {userId} added to 'HR' group");
+                            //   Console.WriteLine($"User {userId} added to 'HR' group");
                         }
 
                         // Preserve role-based group logic for managers and team leaders
@@ -102,7 +386,7 @@ public class NotificationHub : Hub
                                 if (!string.IsNullOrEmpty(dept))
                                 {
                                     Groups.Add(Context.ConnectionId, deptGroup);
-                         //           Console.WriteLine($"User {userId} added to '{deptGroup}' group");
+                                    //           Console.WriteLine($"User {userId} added to '{deptGroup}' group");
                                 }
                             }
                         }
@@ -112,23 +396,6 @@ public class NotificationHub : Hub
         }
 
         Clients.AllExcept(Context.ConnectionId).updateUserStatus(userId, true);
-    }
-    // Update the NotifyNewRequest method to pass the requester's ID
-    public async Task NotifyNewRequest(string department, int requesterId)
-    {
-        // Notify HR and manager groups to refresh requests and notifications
-        // while passing the ID of the user who created the request
-        await Clients.Group("HR").RefreshRequests();
-        await Clients.Group("Manager_" + department).RefreshRequests();
-        await Clients.Group("HR").RefreshNotifications(requesterId);
-        await Clients.Group("Manager_" + department).RefreshNotifications(requesterId);
-    }
-    public async Task NotifyNewRequestWithDetails(string department, int requestId, string userFullName, string requestType, string requestFromDay, string requestStatus, int requesterId)
-    {
-        await Clients.Group("HR").AddNewRequest(requestId, userFullName, requestType, requestFromDay, requestStatus);
-        await Clients.Group("Manager_" + department).AddNewRequest(requestId, userFullName, requestType, requestFromDay, requestStatus);
-        await Clients.Group("HR").RefreshNotifications(requesterId);
-        await Clients.Group("Manager_" + department).RefreshNotifications(requesterId);
     }
     public override Task OnDisconnected(bool stopCalled)
     {
@@ -162,7 +429,7 @@ public class NotificationHub : Hub
     {
         try
         {
-            using (var connection = new SqlConnection(connectionString))
+            using (var connection = Database.getConnection())
             {
                 await connection.OpenAsync();
                 using (var cmd = new SqlCommand(
@@ -180,98 +447,56 @@ public class NotificationHub : Hub
             Console.WriteLine($"Error updating user connection status: {ex.Message}\nStackTrace: {ex.StackTrace}");
         }
     }
-    public List<int> GetConnectedUserIDs()
-    {
-        lock (_connectionLock)
-        {
-            return _userConnections.Keys.ToList();
-        }
-    }
-    public async Task SendNotification(List<int> receiverIDs, string message, int? senderID = null, bool isChatMessage = false, bool queueIfOffline = false)
-    {
-        if (isChatMessage && senderID.HasValue)
-        {
-            // Get the chat partner (receiver) ID, ensuring it excludes the sender
-            int chatPartnerId = receiverIDs.FirstOrDefault(id => id != senderID.Value);
-            if (chatPartnerId == 0 || chatPartnerId == senderID.Value)
-            {
-                Console.WriteLine($"Invalid chat partner ID for sender {senderID}. Skipping message.");
-                return;
-            }
+    #endregion
 
-            var targetIDs = new List<int> { chatPartnerId };
-            foreach (int targetID in targetIDs.Distinct())
-            {
-                var connectionIDs = GetConnectionIDsByUserID(targetID);
-                if (connectionIDs != null && connectionIDs.Any())
-                {
-                   // Console.WriteLine($"Sending chat message from {senderID} to {targetID}: {message}");
-                    Clients.Clients(connectionIDs).receivePendingMessage(senderID.Value, message); // Send only senderId and message
-                }
-                else if (queueIfOffline)
-                {
-                    using (SqlConnection connection = new SqlConnection(connectionString))
-                    {
-                        await connection.OpenAsync();
-                        using (var cmd = new SqlCommand(
-                            "INSERT INTO PendingChatMessages (SenderID, ReceiverID, Message, CreatedAt, IsDelivered) VALUES (@SenderID, @ReceiverID, @Message, @CreatedAt, 0)",
-                            connection))
-                        {
-                            cmd.Parameters.AddWithValue("@SenderID", senderID.Value);
-                            cmd.Parameters.AddWithValue("@ReceiverID", targetID);
-                            cmd.Parameters.AddWithValue("@Message", message);
-                            cmd.Parameters.AddWithValue("@CreatedAt", DateTime.Now);
-                            await cmd.ExecuteNonQueryAsync();
-                            Console.WriteLine($"Queued chat message for offline user {targetID} from {senderID}");
-                        }
-                    }
-                }
-            }
-        }
-        else if (receiverIDs != null && receiverIDs.Any())
+    #region Requests Methods
+    // Update the NotifyNewRequest method to pass the requester's ID
+    public async Task NotifyNewRequest(string department, int requesterId)
+    {
+        // Notify HR and manager groups to refresh requests and notifications
+        // while passing the ID of the user who created the request
+        await Clients.Group("HR").RefreshRequests();
+        await Clients.Group("Manager_" + department).RefreshRequests();
+        await Clients.Group("HR").RefreshNotifications(requesterId);
+        await Clients.Group("Manager_" + department).RefreshNotifications(requesterId);
+    }
+    public async Task NotifyNewRequestWithDetails(string department, int requestId, string userFullName, string requestType, string requestFromDay, string requestStatus, int requesterId)
+    {
+        await Clients.Group("HR").AddNewRequest(requestId, userFullName, requestType, requestFromDay, requestStatus);
+        await Clients.Group("Manager_" + department).AddNewRequest(requestId, userFullName, requestType, requestFromDay, requestStatus);
+        await Clients.Group("HR").RefreshNotifications(requesterId);
+        await Clients.Group("Manager_" + department).RefreshNotifications(requesterId);
+    }
+    public void NotifyAffectedUsers(List<int> userIds)
+    {
+        // Get the connection ID of the caller to avoid notifying the sender
+        string callerConnectionId = Context.ConnectionId;
+
+        foreach (int userId in userIds)
         {
-            // Handle broadcast to specific users (non-chat notification)
-            foreach (int receiverID in receiverIDs.Distinct())
+            var connectionIDs = GetConnectionIDsByUserID(userId);
+            if (connectionIDs != null && connectionIDs.Count > 0)
             {
-                if (senderID.HasValue && receiverID == senderID.Value)
+                // Filter out the caller's connection ID to prevent self-notification
+                var filteredConnectionIDs = connectionIDs.Where(id => id != callerConnectionId).ToList();
+
+                if (filteredConnectionIDs.Any())
                 {
-                   // Console.WriteLine($"Skipping broadcast for sender {senderID} to {receiverID}");
-                    continue;
-                }
-                var connectionIDs = GetConnectionIDsByUserID(receiverID);
-                if (connectionIDs != null && connectionIDs.Any())
-                {
-                    Console.WriteLine($"Sending broadcast notification from {senderID ?? -1} to {receiverID}: {message}");
-                    Clients.Clients(connectionIDs).receiveGeneralNotification(senderID.Value, message);
+                    //Console.WriteLine($"Notifying user {userId} to refresh requests.");
+                    Clients.Clients(filteredConnectionIDs).RefreshRequests();
                 }
             }
-        }
-        else
-        {
-            // Handle broadcast to all online users (non-chat notification)
-            Console.WriteLine($"Broadcasting general notification from {senderID ?? -1} to all online users: {message}");
-            var onlineUserIds = GetConnectedUserIDs();
-            if (senderID.HasValue)
-            {
-                onlineUserIds = onlineUserIds.Except(new[] { senderID.Value }).ToList();
-            }
-            foreach (int userId in onlineUserIds)
-            {
-                var connectionIDs = GetConnectionIDsByUserID(userId);
-                if (connectionIDs != null && connectionIDs.Any())
-                {
-                    Console.WriteLine($"Sending to online user {userId} with connections: {string.Join(", ", connectionIDs)}");
-                    Clients.Clients(connectionIDs).receiveGeneralNotification(senderID.Value, message);
-                }
-            }
-            await InsertGeneralNotificationForOnlineUsers(onlineUserIds, senderID, message);
         }
     }
+    #endregion
+
+    #region General Notification Methods
+
     private async Task InsertGeneralNotificationForOnlineUsers(List<int> onlineUserIds, int? senderID, string message)
     {
         try
         {
-            using (SqlConnection connection = new SqlConnection(connectionString))
+            using (SqlConnection connection = Database.getConnection())
             {
                 await connection.OpenAsync();
                 string query = @"
@@ -303,7 +528,7 @@ public class NotificationHub : Hub
     {
         try
         {
-            using (SqlConnection connection = new SqlConnection(connectionString))
+            using (SqlConnection connection = Database.getConnection())
             {
                 await connection.OpenAsync();
                 using (var cmd = new SqlCommand(
@@ -336,192 +561,8 @@ public class NotificationHub : Hub
             return new List<string>();
         }
     }
-    public Dictionary<int, PendingMessageData> GetPendingMessageCounts(int receiverId)
-    {
-        var result = new Dictionary<int, PendingMessageData>();
-        using (var connection = new SqlConnection(connectionString))
-        {
-            connection.Open();
-            using (var cmd = new SqlCommand(
-                        @"SELECT SenderID, COUNT(*) AS MessageCount, COALESCE(STRING_AGG(Message, '|'), '') AS Messages 
-              FROM PendingChatMessages 
-              WHERE ReceiverID = @ReceiverID AND IsDelivered = 0 AND SenderID != @ReceiverID 
-              GROUP BY SenderID",
-                        connection))
-            {
-                cmd.Parameters.AddWithValue("@ReceiverID", receiverId);
-                using (var reader = cmd.ExecuteReader())
-                {
-                    while (reader.Read())
-                    {
-                        var senderId = reader.GetInt32(reader.GetOrdinal("SenderId"));
-                        var count = reader.GetInt32(reader.GetOrdinal("MessageCount"));
-                        var messages = reader.GetString(reader.GetOrdinal("Messages"));
-                        result[senderId] = new PendingMessageData
-                        {
-                            Count = count,
-                            Messages = messages.Split('|').ToList()
-                        };
-                    }
-                }
-            }
-        }
-        return result;
-    }
-    private void DeliverPendingChatMessages(int userID)
-    {
-        try
-        {
-            using (var connection = new SqlConnection(connectionString))
-            {
-                connection.Open();
-                using (var cmd = new SqlCommand(
-                    "SELECT NotificationID, SenderID, Message FROM PendingChatMessages " +
-                    "WHERE ReceiverID = @ReceiverID AND IsDelivered = 0 " +
-                    "ORDER BY CreatedAt ASC", connection))
-                {
-                    cmd.Parameters.AddWithValue("@ReceiverID", userID);
-                    using (var reader = cmd.ExecuteReader())
-                    {
-                        while (reader.Read())
-                        {
-                            int senderID = reader.GetInt32(1);
-                            string message = reader.GetString(2);
-                            Clients.Clients(GetConnectionIDsByUserID(userID)).receivePendingMessage(senderID, message);
-                        }
-                    }
-                }
-            }
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"Error delivering pending chat messages: {ex.Message}");
-        }
-    }
-    public List<string> GetPendingMessages(int receiverId, int senderId)
-    {
-        var messages = new List<string>();
-        using (var connection = new SqlConnection(connectionString))
-        {
-            connection.Open();
-            using (var cmd = new SqlCommand(
-                "SELECT Message FROM PendingChatMessages " +
-                "WHERE ReceiverId = @ReceiverId AND SenderId = @SenderId",
-                connection))
-            {
-                cmd.Parameters.AddWithValue("@ReceiverId", receiverId);
-                cmd.Parameters.AddWithValue("@SenderId", senderId);
-                using (var reader = cmd.ExecuteReader())
-                {
-                    while (reader.Read())
-                    {
-                        messages.Add(reader["Message"].ToString());
-                    }
-                }
-            }
-        }
-        return messages;
-    }
-    public void MarkMessagesAsDelivered(int senderId, int receiverId)
-    {
-        try
-        {
-            using (var connection = new SqlConnection(connectionString))
-            {
-                connection.Open();
-                using (var cmd = new SqlCommand(
-                    @"UPDATE PendingChatMessages 
-                  SET IsDelivered = 1, 
-                      DeliveredAt = GETDATE() 
-                  WHERE SenderID = @SenderID 
-                    AND ReceiverID = @ReceiverID 
-                    AND IsDelivered = 0",
-                    connection))
-                {
-                    cmd.Parameters.AddWithValue("@SenderID", senderId);
-                    cmd.Parameters.AddWithValue("@ReceiverID", receiverId);
-                    cmd.ExecuteNonQuery();
-                }
-            }
-            // Notify clients to update message counts.
-            Clients.All.updateMessageCounts(receiverId, senderId, 0);
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"Error in MarkMessagesAsDelivered: {ex.Message}\nStackTrace: {ex.StackTrace}");
-            throw; // Propagate the error to the client for debugging.
-        }
-    }
-    public void NotifyAffectedUsers(List<int> userIds)
-    {
-        // Get the connection ID of the caller to avoid notifying the sender
-        string callerConnectionId = Context.ConnectionId;
 
-        foreach (int userId in userIds)
-        {
-            var connectionIDs = GetConnectionIDsByUserID(userId);
-            if (connectionIDs != null && connectionIDs.Count > 0)
-            {
-                // Filter out the caller's connection ID to prevent self-notification
-                var filteredConnectionIDs = connectionIDs.Where(id => id != callerConnectionId).ToList();
-
-                if (filteredConnectionIDs.Any())
-                {
-                    //Console.WriteLine($"Notifying user {userId} to refresh requests.");
-                    Clients.Clients(filteredConnectionIDs).RefreshRequests();
-                }
-            }
-        }
-    }
-    // New method to send global chat messages
-    public async Task SendGlobalChatMessage(string messageId, string message, int senderId)
-    {
-        // Broadcast the message to all users in the "global" group
-        await Clients.Group("global").receiveGlobalChatMessage(messageId, senderId, message);
-        // Save the message to the database
-        await SaveGlobalChatMessage(messageId, senderId, message);
-    }
-    // Helper method to save messages to the database
-    private async Task SaveGlobalChatMessage(string messageId, int senderId, string message)
-    {
-        using (SqlConnection connection = new SqlConnection(connectionString))
-        {
-            await connection.OpenAsync();
-            string query = "INSERT INTO GlobalChatMessages (MessageID, SenderID, Message, Timestamp) " +
-                          "VALUES (@MessageID, @SenderID, @Message, @Timestamp)";
-            using (SqlCommand cmd = new SqlCommand(query, connection))
-            {
-                cmd.Parameters.AddWithValue("@MessageID", messageId);
-                cmd.Parameters.AddWithValue("@SenderID", senderId);
-                cmd.Parameters.AddWithValue("@Message", message);
-                cmd.Parameters.AddWithValue("@Timestamp", DateTime.Now);
-                await cmd.ExecuteNonQueryAsync();
-            }
-        }
-    }
-    public async Task SendDepartmentChatMessage(string messageId, string message, int senderId, string department)
-    {
-        await Clients.Group(department).receiveDepartmentChatMessage(messageId, senderId, message);
-        await SaveDepartmentChatMessage(messageId, senderId, message, department);
-    }
-    private async Task SaveDepartmentChatMessage(string messageId, int senderId, string message, string department)
-    {
-        using (SqlConnection connection = new SqlConnection(connectionString))
-        {
-            await connection.OpenAsync();
-            string query = "INSERT INTO DepartmentChatMessages (MessageID, SenderID, Message, Department, Timestamp) " +
-                          "VALUES (@MessageID, @SenderID, @Message, @Department, @Timestamp)";
-            using (SqlCommand cmd = new SqlCommand(query, connection))
-            {
-                cmd.Parameters.AddWithValue("@MessageID", messageId);
-                cmd.Parameters.AddWithValue("@SenderID", senderId);
-                cmd.Parameters.AddWithValue("@Message", message);
-                cmd.Parameters.AddWithValue("@Department", department);
-                cmd.Parameters.AddWithValue("@Timestamp", DateTime.Now);
-                await cmd.ExecuteNonQueryAsync();
-            }
-        }
-    }
+    #endregion
 
 
     /* public void RegisterUserConnection(int userID)
