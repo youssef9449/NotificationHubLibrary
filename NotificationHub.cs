@@ -246,6 +246,7 @@ public class NotificationHub : Hub
             return _userConnections.Keys.ToList();
         }
     }
+
     // New method to send global chat messages
     //public async Task SendGlobalChatMessage(string messageId, string message, int senderId)
     //{
@@ -303,7 +304,6 @@ public class NotificationHub : Hub
         // Avoid full refresh here, handled in RegisterUserConnection
         return base.OnConnected();
     }
-    // 1. First, in your Hub class, modify DisconnectUser method:
     public async Task DisconnectUser(int userId)
     {
         lock (_connectionLock)
@@ -447,6 +447,24 @@ public class NotificationHub : Hub
             Console.WriteLine($"Error updating user connection status: {ex.Message}\nStackTrace: {ex.StackTrace}");
         }
     }
+    /* public void RegisterUserConnection(int userID)
+{
+ lock (_connectionLock)
+ {
+     string connectionID = Context.ConnectionId;
+     if (!_userConnections.ContainsKey(userID))
+     {
+         _userConnections[userID] = new List<string>();
+     }
+     if (!_userConnections[userID].Contains(connectionID))
+     {
+         _userConnections[userID].Add(connectionID);
+     }
+ }
+ Clients.All.updateUserList();
+ DeliverPendingChatMessages(userID);
+ UpdateUserConnectionStatus(userID, true); // Add this
+}*/
     #endregion
 
     #region Requests Methods
@@ -460,14 +478,14 @@ public class NotificationHub : Hub
         await Clients.Group("HR").RefreshNotifications(requesterId);
         await Clients.Group("Manager_" + department).RefreshNotifications(requesterId);
     }
-    public async Task NotifyNewRequestWithDetails(string department, int requestId, string userFullName, string requestType, string requestFromDay, string requestStatus, int requesterId)
-    {
-        await Clients.Group("HR").AddNewRequest(requestId, userFullName, requestType, requestFromDay, requestStatus);
-        await Clients.Group("Manager_" + department).AddNewRequest(requestId, userFullName, requestType, requestFromDay, requestStatus);
-        await Clients.Group("HR").RefreshNotifications(requesterId);
-        await Clients.Group("Manager_" + department).RefreshNotifications(requesterId);
-    }
-    public void NotifyAffectedUsers(List<int> userIds)
+    //public async Task NotifyNewRequestWithDetails(string department, int requestId, string userFullName, string requestType, string requestFromDay, string requestStatus, int requesterId)
+    //{
+    //    await Clients.Group("HR").AddNewRequest(requestId, userFullName, requestType, requestFromDay, requestStatus);
+    //    await Clients.Group("Manager_" + department).AddNewRequest(requestId, userFullName, requestType, requestFromDay, requestStatus);
+    //    await Clients.Group("HR").RefreshNotifications(requesterId);
+    //    await Clients.Group("Manager_" + department).RefreshNotifications(requesterId);
+    //}
+    public void refreshRequestsFormForAffectedUsers(List<int> userIds)
     {
         // Get the connection ID of the caller to avoid notifying the sender
         string callerConnectionId = Context.ConnectionId;
@@ -564,25 +582,6 @@ public class NotificationHub : Hub
 
     #endregion
 
-
-    /* public void RegisterUserConnection(int userID)
- {
-     lock (_connectionLock)
-     {
-         string connectionID = Context.ConnectionId;
-         if (!_userConnections.ContainsKey(userID))
-         {
-             _userConnections[userID] = new List<string>();
-         }
-         if (!_userConnections[userID].Contains(connectionID))
-         {
-             _userConnections[userID].Add(connectionID);
-         }
-     }
-     Clients.All.updateUserList();
-     DeliverPendingChatMessages(userID);
-     UpdateUserConnectionStatus(userID, true); // Add this
- }*/
 
     public class PendingMessageData
     {
